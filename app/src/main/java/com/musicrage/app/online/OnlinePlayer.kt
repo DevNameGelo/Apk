@@ -375,8 +375,7 @@ object OnlinePlayer {
         view.webChromeClient = object : WebChromeClient() {
             // A sandboxed player never opens new windows: every pop-up ad dies here.
             override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, result: android.os.Message): Boolean {
-                // Refuse the window and swallow the message so nothing crashes on the dangling result.
-                (result.obj as? android.os.Handler)?.sendToTarget()
+                // Returning false refuses the window; nothing is sent through the result message.
                 return false
             }
         }
