@@ -1,0 +1,168 @@
+name: Build Music Rage APKs
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Optional: a private keystore stored in repository secrets overrides the one in /signing.
+  KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+  MR_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+  MR_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+  MR_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+concurrency:
+  group: music-rage-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 9.6.0
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.6.0'
+
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android SDK platform 37
+        run: sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0"
+
+      - name: Show build environment
+        run: |
+          java -version
+          gradle --version
+
+      - name: Use keystore from repository secrets (optional)
+        shell: bash
+        run: |
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            mkdir -p signing
+            echo "$KEYSTORE_BASE64" | base64 -d > signing/music-rage.keystore
+            echo "Using keystore from repository secrets."
+          else
+            echo "Using the keystore committed in /signing."
+          fi
+
+      - name: Build signed release APKs for each ABI and universal
+        run: gradle --no-daemon :app:assembleRelease
+
+      - name: Show signing certificate (must be identical on every build)
+        shell: bash
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          APK="$(find app/build/outputs/apk/release -name '*universal*.apk' | head -n 1)"
+          "$SDK/build-tools/37.0.0/apksigner" verify --print-certs "$APK" || true
+
+      - name: Collect and compress APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-distribution/apks
+          python3 <<'PY'
+          from pathlib import Path
+          import shutil
+          import zipfile
+
+          apk_root = Path("app/build/outputs/apk/release")
+          apks = list(apk_root.rglob("*.apk"))
+          if not apks:
+              raise SystemExit(f"No APKs found under {apk_root}")
+
+          picked = {}
+          for apk in apks:
+              name = apk.name.lower()
+              if "universal" in name or name == "app-release.apk":
+                  picked["Music-Rage-Universal.apk"] = apk
+              elif "arm64-v8a" in name:
+                  picked["Music-Rage-arm64-v8a.apk"] = apk
+              elif "armeabi-v7a" in name:
+                  picked["Music-Rage-armeabi-v7a.apk"] = apk
+              elif "x86_64" in name:
+                  picked["Music-Rage-x86_64.apk"] = apk
+              elif "x86" in name:
+                  picked["Music-Rage-x86.apk"] = apk
+
+          expected = [
+              "Music-Rage-arm64-v8a.apk",
+              "Music-Rage-armeabi-v7a.apk",
+              "Music-Rage-x86_64.apk",
+              "Music-Rage-x86.apk",
+              "Music-Rage-Universal.apk",
+          ]
+
+          # The Android Gradle Plugin may place the universal output in the root
+          # and ABI outputs in subdirectories. This matcher also tolerates that.
+          missing = [name for name in expected if name not in picked]
+          if missing:
+              print("APK files found:")
+              for apk in apks:
+                  print(f" - {apk}")
+              raise SystemExit("Missing expected APK outputs: " + ", ".join(missing))
+
+          out = Path("build-distribution/apks")
+          for target, source in picked.items():
+              shutil.copy2(source, out / target)
+              print(f"Copied {source} -> {out / target}")
+
+          readme = Path("build-distribution/BUILD-INFO.txt")
+          readme.write_text(
+              "Music Rage 1.2.6 - GitHub Actions release build\n"
+              "Application ID: com.musicrage.app\n"
+              "Minimum Android: 10 (API 29)\n"
+              "Primary device build: arm64-v8a\n"
+              "Included ABI packages: armeabi-v7a, arm64-v8a, x86, x86_64, universal\n"
+              "All builds are signed with the same key, so each new APK installs over the previous one and keeps playlists, favorites and settings.\n",
+              encoding="utf-8",
+          )
+
+          with zipfile.ZipFile("build-distribution/Music-Rage-All-APKs.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+              for file in sorted(out.glob("*.apk")):
+                  archive.write(file, arcname=f"APKs/{file.name}")
+              archive.write(readme, arcname=readme.name)
+          PY
+
+      - name: Upload ARM64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Music-Rage-arm64-v8a
+          path: build-distribution/apks/Music-Rage-arm64-v8a.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload universal APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Music-Rage-Universal
+          path: build-distribution/apks/Music-Rage-Universal.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload all APKs ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Music-Rage-All-APKs
+          path: build-distribution/Music-Rage-All-APKs.zip
+          if-no-files-found: error
+          retention-days: 30
