@@ -63,7 +63,7 @@ data class OnlineState(
  */
 object OnlineLoading {
     var active by mutableStateOf(false)
-        private set
+        internal set
 }
 /** Saved online-player state, used for "Continue playing" and for recovery after the app is killed. */
 object OnlineStore {
@@ -249,7 +249,6 @@ private const val WATCH_JS = """
   window.mrPlay = function () { var v = document.querySelector('video'); if (v) { v.play(); } };
   window.mrPause = function () { var v = document.querySelector('video'); if (v) { v.pause(); } };
   window.mrSeek = function (s) { var v = document.querySelector('video'); if (v) { v.currentTime = s; } };
-  var lastReported = null;
   setInterval(function () {
     hook();
     forceSound();
@@ -262,7 +261,6 @@ private const val WATCH_JS = """
       // can follow it instead of showing a stale title.
       Android.pageVideo(id || '');
       Android.time(v.currentTime, v.duration);
-      lastReported = id;
     }
   }, 1000);
 })();
@@ -376,7 +374,11 @@ object OnlinePlayer {
         }
         view.webChromeClient = object : WebChromeClient() {
             // A sandboxed player never opens new windows: every pop-up ad dies here.
-            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean): WebView? = null
+            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, result: android.os.Message): Boolean {
+                // Refuse the window and swallow the message so nothing crashes on the dangling result.
+                (result.obj as? android.os.Handler)?.sendToTarget()
+                return false
+            }
         }
         view.addJavascriptInterface(Bridge(), "Android")
         runCatching {
@@ -798,7 +800,7 @@ object OnlinePlayer {
             val video = state.video
             val context = appContext
             // Embedding is blocked or misconfigured for this video: play it from the normal watch page instead.
-            if (!watchMode && video != null && context != null && OnlineStore.blocked(context).add(video.id)) {
+            if (!watchMode && video != null && context != null && !OnlineStore.blocked(context).contains(video.id)) {
                 OnlineStore.addBlocked(context, video.id)
                 watchToken += 1
                 loadWatchPage(video.id, 0.0)
