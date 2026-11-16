@@ -56,7 +56,9 @@ class OnlineService : Service() {
         if (recovering) {
             recovering = false
             if (!OnlinePlayer.state.isPlaying) {
-                toast("Couldn't resume automatically. Open Music Rage and tap play.")
+                // A failed recovery is quiet: the Online tab already shows the "continue playing" entry,
+                // and a toast here would fight with the local player's own recovery messages.
+                OnlinePlayer.stop()
             }
             refresh()
         }
@@ -82,7 +84,7 @@ class OnlineService : Service() {
 
         // A previous instance that was playing and never reached onDestroy means the process was killed.
         val killed = OnlineStore.isAlive(this)
-        if (killed && MusicPreferences.autoRecover(this)) beginRecovery()
+        if (killed && MusicPreferences.autoRecover(this) && OnlinePlayer.state.video == null) beginRecovery()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

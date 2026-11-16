@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.9
+- Fixed the confusing toast spam: opening the app, starting online music or switching to a local song no longer fires "This video can't be played" and "Music Rage was closed in the background" at the same time. A failed recovery is now silent, and the local service only announces a real kill of its own session; the online service no longer "recovers" a video that was already replaced. Repeated embed failures now stop after three tries instead of looping.
+- A loading spinner now appears on the Online tab (on the cover, on the play button and in the mini player) while a song is still buffering, and disappears the moment it actually plays.
+- The online player now runs in a sandbox: only YouTube player/CDN hosts can load, ad and tracker hosts (doubleclick, googlesyndication, adservice…) are refused before their scripts run, pop-up windows are refused outright, ad overlays are auto-closed and "Skip" is clicked automatically on the watch page.
+- The watch page now reports which video it is really on, so when YouTube auto-advances to a related video (or an ad forces its own navigation) the now-playing card, mini bar and notification update to the actual song instead of staying stuck on the old title.
+- The position-inheritance bug is fully closed: the page-side time reports are gated by the video id, so the old video's 17 s / 50 s can never reach the new track or the watch-page fallback URL while the new one is still loading.
+
 ## 1.2.8
 - Playing a local song while online music is playing now pauses the online player completely: it stands down, its bar disappears and the local player takes over the notification — before, the online bar stayed on screen forever and the local player looked like it "didn't play".
 - Switching to another online song always starts it at 0:00. Late progress reports from the previous video used to overwrite the new track's position and even make the watch-page fallback resume at the old timestamp (the "skips to 50 seconds" bug).

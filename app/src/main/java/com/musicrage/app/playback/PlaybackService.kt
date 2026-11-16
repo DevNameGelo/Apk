@@ -128,9 +128,17 @@ class PlaybackService : MediaSessionService() {
         // was killed (low memory, a game's memory cleaner, an OEM task killer).
         val killed = PlaybackStore.isSessionAlive(this)
         if (killed) {
-            toast("Music Rage was closed in the background")
-            if (MusicPreferences.autoRecover(this)) {
-                beginRecovery()
+            // Only a REAL local playback session announces itself. If the online player owned the notification
+            // when the process died, the local service waking up here would fire a bogus "closed in background"
+            // toast while the online service recovers in parallel.
+            if (PlaybackStore.load(this) != null) {
+                toast("Music Rage was closed in the background")
+                if (MusicPreferences.autoRecover(this)) {
+                    beginRecovery()
+                } else {
+                    PlaybackStore.setSessionAlive(this, false)
+                    restorePaused()
+                }
             } else {
                 PlaybackStore.setSessionAlive(this, false)
                 restorePaused()

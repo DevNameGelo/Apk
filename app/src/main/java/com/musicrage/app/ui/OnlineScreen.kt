@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
@@ -52,6 +53,7 @@ import com.musicrage.app.R
 import com.musicrage.app.data.ArtworkLoader
 import com.musicrage.app.data.OnlineApi
 import com.musicrage.app.data.OnlineVideo
+import com.musicrage.app.online.OnlineLoading
 import com.musicrage.app.online.OnlinePlayer
 import com.musicrage.app.online.OnlineStore
 import kotlinx.coroutines.Dispatchers
@@ -198,6 +200,7 @@ fun OnlineScreen(activity: MainActivity) {
 private fun OnlineNowPlaying(video: OnlineVideo, playing: Boolean) {
     val duration = OnlinePlayer.durationSec
     val position = OnlinePlayer.positionSec
+    val loading = OnlineLoading.active
     var drag by remember { mutableStateOf<Float?>(null) }
     val live = if (duration > 0.0) (position / duration).toFloat().coerceIn(0f, 1f) else 0f
     val shown = drag ?: live
@@ -208,12 +211,19 @@ private fun OnlineNowPlaying(video: OnlineVideo, playing: Boolean) {
             .background(Rage.Surface)
     ) {
         Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            // Square cover, exactly like the local player's tiles.
-            NetImage(video.thumb, Modifier.size(64.dp), RoundedCornerShape(8.dp))
+            // Square cover, exactly like the local player's tiles. A spinner overlays it while loading.
+            Box {
+                NetImage(video.thumb, Modifier.size(64.dp), RoundedCornerShape(8.dp))
+                if (loading) {
+                    Box(Modifier.size(64.dp).clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(alpha = 0.45f)), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(color = Rage.Accent, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                    }
+                }
+            }
             Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
                 Text(video.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Spacer(Modifier.height(3.dp))
-                Text(video.channel, color = Rage.TextDim, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(if (loading) "Loading…" else video.channel, color = Rage.TextDim, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
         OnlineProgress(
@@ -237,7 +247,11 @@ private fun OnlineNowPlaying(video: OnlineVideo, playing: Boolean) {
                 Modifier.size(54.dp).clip(CircleShape).background(Color.White).clickable { OnlinePlayer.toggle() },
                 contentAlignment = Alignment.Center
             ) {
-                RIcon(if (playing) R.drawable.ic_pause else R.drawable.ic_play, tint = Color.Black, size = 24.dp)
+                if (loading) {
+                    CircularProgressIndicator(color = Color.Black, strokeWidth = 2.5.dp, modifier = Modifier.size(26.dp))
+                } else {
+                    RIcon(if (playing) R.drawable.ic_pause else R.drawable.ic_play, tint = Color.Black, size = 24.dp)
+                }
             }
             Spacer(Modifier.weight(1f))
             IconAction(R.drawable.ic_skip_next, { OnlinePlayer.next() }, size = 24.dp, contentDescription = "Next")
@@ -344,6 +358,7 @@ private fun OnlineRow(video: OnlineVideo, isCurrent: Boolean, onClick: () -> Uni
 fun OnlineMiniBar(onOpen: () -> Unit) {
     val state = OnlinePlayer.state
     val video = state.video ?: return
+    val loading = OnlineLoading.active
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp).clip(RoundedCornerShape(10.dp))
             .background(Rage.SurfaceHigh).clickable(onClick = onOpen).padding(start = 8.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
@@ -352,9 +367,13 @@ fun OnlineMiniBar(onOpen: () -> Unit) {
         NetImage(video.thumb, Modifier.size(width = 64.dp, height = 36.dp), RoundedCornerShape(5.dp))
         Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
             Text(video.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text("Online · " + video.channel, color = Rage.TextDim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(if (loading) "Loading…" else "Online · " + video.channel, color = Rage.TextDim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        IconAction(if (state.isPlaying) R.drawable.ic_pause else R.drawable.ic_play, { OnlinePlayer.toggle() }, size = 22.dp, contentDescription = "Play or pause")
+        if (loading) {
+            CircularProgressIndicator(color = Rage.Accent, strokeWidth = 2.dp, modifier = Modifier.padding(end = 12.dp).size(18.dp))
+        } else {
+            IconAction(if (state.isPlaying) R.drawable.ic_pause else R.drawable.ic_play, { OnlinePlayer.toggle() }, size = 22.dp, contentDescription = "Play or pause")
+        }
         IconAction(R.drawable.ic_skip_next, { OnlinePlayer.next() }, size = 22.dp, contentDescription = "Next")
     }
 }

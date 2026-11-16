@@ -17,6 +17,8 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -29,6 +31,7 @@ import com.musicrage.app.data.MusicPreferences
 import com.musicrage.app.data.OnlineVideo
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 
 /**
  * WebView that keeps believing it is visible, so the embedded player keeps playing when the app is in the
@@ -54,6 +57,14 @@ data class OnlineState(
     val hasNext: Boolean = false
 )
 
+/**
+ * The loading overlay state for the Online tab: true from the moment a video is requested until the
+ * page reports it is actually playing. Null when nothing is loading.
+ */
+object OnlineLoading {
+    var active by mutableStateOf(false)
+        private set
+}
 /** Saved online-player state, used for "Continue playing" and for recovery after the app is killed. */
 object OnlineStore {
     private const val KEY_LAST = "online_last"
@@ -118,6 +129,16 @@ object OnlineStore {
         val last = prefs(context).getLong(KEY_BEAT, 0L)
         return if (last == 0L) Long.MAX_VALUE else System.currentTimeMillis() - last
     }
+
+    private const val KEY_BLOCKED = "online_blocked"
+
+    /** IDs that refuse to play in the embedded player, remembered so a restart goes straight to the watch page. */
+    fun blocked(context: Context): Set<String> =
+        prefs(context).getStringSet(KEY_BLOCKED, emptySet())?.toSet() ?: emptySet()
+
+    fun addBlocked(context: Context, id: String) {
+        prefs(context).edit().putStringSet(KEY_BLOCKED, blocked(context) + id).apply()
+    }
 }
 
 private const val PLAYER_HTML = """
@@ -129,6 +150,7 @@ private const val PLAYER_HTML = """
 <script>
 var player = null;
 var pending = null;
+var loadId = null;
 function onYouTubeIframeAPIReady() {
   player = new YT.Player('p', {
     width: '100%', height: '100%',
@@ -141,12 +163,23 @@ function onYouTubeIframeAPIReady() {
   });
 }
 function forceSound() { try { if (player && player.isMuted && player.isMuted()) { player.unMute(); } if (player && player.setVolume) { player.setVolume(100); } } catch (e) {} }
-function load(id, start) { if (player && player.loadVideoById) { player.loadVideoById(id, start || 0); forceSound(); } else { pending = [id, start]; } }
+function load(id, start) {
+  loadId = id;
+  pending = null;
+  if (player && player.loadVideoById) { player.loadVideoById(id, start || 0); forceSound(); }
+  else { pending = [id, start]; }
+}
 function playVideo2() { if (player) { player.playVideo(); forceSound(); } }
 function pauseVideo2() { if (player) player.pauseVideo(); }
 function seek(s) { if (player) player.seekTo(s, true); }
 setInterval(function () {
-  if (player && player.getCurrentTime && player.getDuration) { Android.time(player.getCurrentTime(), player.getDuration()); }
+  if (player && player.getCurrentTime && player.getDuration) {
+    // Only report the video the app actually asked for. While a new video is still loading the
+    // iframe keeps answering for the old one, and those numbers used to leak into the new track.
+    if (loadId === null || loadId === (player.getVideoData ? player.getVideoData().video_id : loadId)) {
+      Android.time(player.getCurrentTime(), player.getDuration());
+    }
+  }
 }, 1000);
 </script></body></html>
 """
@@ -173,7 +206,8 @@ private const val WATCH_JS = """
     'width:100vw!important;height:100vh!important;z-index:2147483647!important;background:#000!important;' +
     'object-fit:contain!important}' +
     '.ad-showing, .ad-interrupting, ytmusic-video-player, #player-ads, .ytp-ad-module, ' +
-    '.video-ads, .ytp-ad-overlay-container, .ytp-ad-image-overlay{display:none!important}';
+    '.video-ads, .ytp-ad-overlay-container, .ytp-ad-image-overlay, .ytp-ad-progress, ' +
+    '.ytp-ad-text, ytm-playlist-video-renderer, ytm-notification, .masthead-ad, #masthead-ad{display:none!important}';
   (document.head || document.documentElement).appendChild(st);
   function forceSound() {
     try {
@@ -185,11 +219,22 @@ private const val WATCH_JS = """
     } catch (e) {}
   }
   function adShowing() { return !!document.querySelector('.ad-showing, .ad-interrupting'); }
+  function pageVideoId() {
+    try {
+      if (window.ytcfg && ytcfg.data_ && ytcfg.data_.videoId) { return ytcfg.data_.videoId; }
+      var m = /[?&]v=([A-Za-z0-9_-]{11})/.exec(location.search);
+      if (m) { return m[1]; }
+    } catch (e) {}
+    return null;
+  }
   function skipAd() {
     // Click "Skip" if an ad grows one; harmless otherwise.
     try {
       var b = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
       if (b) { b.click(); }
+      // Ads on the mobile page sometimes sit in an overlay the page itself opens; close it.
+      var c = document.querySelector('.ytp-ad-overlay-close-button, [aria-label="Close"]');
+      if (c) { c.click(); }
     } catch (e) {}
   }
   function hook() {
@@ -204,12 +249,21 @@ private const val WATCH_JS = """
   window.mrPlay = function () { var v = document.querySelector('video'); if (v) { v.play(); } };
   window.mrPause = function () { var v = document.querySelector('video'); if (v) { v.pause(); } };
   window.mrSeek = function (s) { var v = document.querySelector('video'); if (v) { v.currentTime = s; } };
+  var lastReported = null;
   setInterval(function () {
     hook();
     forceSound();
     if (adShowing()) { skipAd(); }
     var v = document.querySelector('video');
-    if (v && v.duration > 0 && isFinite(v.duration) && !adShowing()) { Android.time(v.currentTime, v.duration); }
+    if (v && v.duration > 0 && isFinite(v.duration) && !adShowing()) {
+      var id = pageVideoId();
+      // The watch page auto-advances to a related video when one ends, and ads can force their own
+      // navigation. Tell the app which video the page is REALLY on so the card and notification
+      // can follow it instead of showing a stale title.
+      Android.pageVideo(id || '');
+      Android.time(v.currentTime, v.duration);
+      lastReported = id;
+    }
   }, 1000);
 })();
 """
@@ -226,6 +280,9 @@ private class Bridge {
 
     @JavascriptInterface
     fun failed(code: Int) = OnlinePlayer.handleError(code)
+
+    @JavascriptInterface
+    fun pageVideo(id: String) = OnlinePlayer.handlePageVideo(id)
 }
 
 object OnlinePlayer {
@@ -242,7 +299,7 @@ object OnlinePlayer {
     private var lastPlaced: IntArray? = null
     private var watchMode = false
     private var watchToken = 0
-    private val blocked = HashSet<String>()
+    private var failStreak = 0
 
     /**
      * Rises every time a new video starts or playback is stopped. Events still arriving from the page
@@ -293,12 +350,34 @@ object OnlinePlayer {
         view.settings.mediaPlaybackRequiresUserGesture = false
         view.settings.userAgentString =
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+        // Sandbox: the page can only talk to YouTube (player, thumbnail and API delivery). Ad and tracker
+        // hosts are refused outright, so their scripts never run and their videos never get requested.
         view.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val host = request.url.host ?: return true
+                return !isAllowedHost(host)
+            }
+
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                val host = request.url.host ?: return BLOCKED_RESPONSE
+                return if (isAllowedHost(host)) null else BLOCKED_RESPONSE
+            }
+
             override fun onPageFinished(view: WebView, url: String?) {
-                if (watchMode && url != null && url.contains("youtube.com/watch")) view.evaluateJavascript(WATCH_JS, null)
+                // Kill any pop-up the page managed to open on top of the video, then re-inject the controls.
+                if (watchMode && url != null && url.contains("youtube.com/watch")) {
+                    view.evaluateJavascript(
+                        "(function(){try{var w=document.querySelector('.ytp-popup, ytm-popup-container, dialog, [role=dialog]');if(w){w.remove();}}catch(e){}})();",
+                        null
+                    )
+                    view.evaluateJavascript(WATCH_JS, null)
+                }
             }
         }
-        view.webChromeClient = WebChromeClient()
+        view.webChromeClient = object : WebChromeClient() {
+            // A sandboxed player never opens new windows: every pop-up ad dies here.
+            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean): WebView? = null
+        }
         view.addJavascriptInterface(Bridge(), "Android")
         runCatching {
             val cookies = CookieManager.getInstance()
@@ -311,6 +390,25 @@ object OnlinePlayer {
         web = view
         if (overlayAllowed()) hostInBackground(warn = false)
         return view
+    }
+
+    /** YouTube pages plus the few CDN/API hosts the player and thumbnails genuinely need. */
+    private fun isAllowedHost(host: String): Boolean {
+        val h = host.lowercase()
+        if (h.endsWith("youtube.com") || h.endsWith("youtube-nocookie.com") || h.endsWith("ytimg.com") ||
+            h.endsWith("googlevideo.com") || h.endsWith("ggpht.com") || h.endsWith("gstatic.com") ||
+            h.endsWith("googleapis.com") || h.endsWith("google.com")
+        ) {
+            // Refuse the known ad-serving subdomains even inside otherwise-allowed domains.
+            val adMarkers = listOf("ads", "adserver", "admob", "doubleclick", "googlesyndication", "adservice", "partnerads")
+            return adMarkers.none { marker -> h == marker || h.startsWith("$marker.") || h.contains(".$marker.") }
+        }
+        return false
+    }
+
+    /** Empty 200 response served in place of every blocked request. */
+    private val BLOCKED_RESPONSE: WebResourceResponse by lazy {
+        WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
     }
 
     private fun loadEmbedPage(view: WebView) {
@@ -479,11 +577,13 @@ object OnlinePlayer {
         // Any event still on its way from the previous video is now obsolete.
         generation += 1
         val gen = generation
+        failStreak = 0
         // Claim the single media notification before anything starts.
         com.musicrage.app.playback.PlaybackSupervisor.claim(context, com.musicrage.app.playback.PlaybackSupervisor.Owner.ONLINE)
         state = OnlineState(video, isPlaying = true, hasPrev = index > 0, hasNext = index < queue.size - 1)
         positionSec = startSec
         durationSec = 0.0
+        OnlineLoading.active = true
         OnlineStore.addHistory(context, video)
         OnlineStore.saveLast(context, video, startSec)
         OnlineStore.setAlive(context, true)
@@ -493,7 +593,7 @@ object OnlinePlayer {
         val view = webView()
         watchToken += 1
         pendingLoad = null
-        if (blocked.contains(video.id)) {
+        if (OnlineStore.blocked(context).contains(video.id)) {
             main.post { loadWatchPage(video.id, startSec) }
             armWatchTimeout(gen)
         } else {
@@ -513,8 +613,11 @@ object OnlinePlayer {
         main.postDelayed({
             if (token == watchToken && gen == generation && !state.isPlaying) {
                 val context = appContext
-                if (context != null) com.musicrage.app.Toaster.show(context, "This video can't be played")
+                if (context != null && state.video != null) {
+                    com.musicrage.app.Toaster.show(context, "This video can't be played")
+                }
                 if (index + 1 < queue.size) next() else {
+                    OnlineLoading.active = false
                     state = state.copy(isPlaying = false)
                     listener?.invoke()
                 }
@@ -585,6 +688,9 @@ object OnlinePlayer {
             val context = appContext
             when (code) {
                 1 -> {
+                    // The page is really playing now: the new track is live and the loading overlay goes away.
+                    OnlineLoading.active = false
+                    failStreak = 0
                     state = state.copy(isPlaying = true)
                     context?.let { OnlineStore.setAlive(it, true) }
                 }
@@ -613,6 +719,7 @@ object OnlinePlayer {
         if (context == null) return
         val seed = finished.title.substringBefore(" (").substringBefore(" [").substringBefore("Official").trim()
         val query = if (finished.channel.isNotBlank()) "${finished.channel} music" else seed.ifEmpty { return }
+        val blocked = OnlineStore.blocked(context)
         Thread {
             val found = runCatching { com.musicrage.app.data.OnlineApi.search(query) }.getOrDefault(emptyList())
             val pick = found.firstOrNull { it.id != finished.id && !blocked.contains(it.id) }
@@ -644,23 +751,79 @@ object OnlinePlayer {
         }
     }
 
+    /**
+     * The watch page reports which video it is really on. YouTube auto-advances to a related video when
+     * one ends (and ads can force their own navigation), so the card, mini bar and notification used to
+     * keep showing the OLD title while something else played. Follow the page instead.
+     */
+    internal fun handlePageVideo(id: String) {
+        val gen = generation
+        main.post {
+            if (gen != generation || id.isBlank() || watchMode) return@post
+            val current = state.video ?: return@post
+            if (id == current.id) return@post
+            // The page moved on. Update the shown video so the UI and notification follow it.
+            val nextVideo = OnlineVideo(id, "Playing next", "Online", current.thumb)
+            state = state.copy(video = nextVideo)
+            queue = listOf(nextVideo)
+            index = 0
+            positionSec = 0.0
+            durationSec = 0.0
+            OnlineLoading.active = true
+            val context = appContext
+            if (context != null) {
+                OnlineStore.addHistory(context, nextVideo)
+                OnlineStore.saveLast(context, nextVideo, 0.0)
+                // Fill in the real title in the background so the card does not stay generic.
+                Thread {
+                    val found = runCatching { com.musicrage.app.data.OnlineApi.search(id) }.getOrDefault(emptyList())
+                    val match = found.firstOrNull { it.id == id }
+                    if (match != null) main.post {
+                        if (state.video?.id == id) {
+                            state = state.copy(video = match)
+                            OnlineStore.saveLast(context, match, 0.0)
+                            listener?.invoke()
+                        }
+                    }
+                }.start()
+            }
+            listener?.invoke()
+        }
+    }
+
     internal fun handleError(code: Int) {
         val gen = generation
         main.post {
             if (gen != generation) return@post
             val video = state.video
+            val context = appContext
             // Embedding is blocked or misconfigured for this video: play it from the normal watch page instead.
-            if (!watchMode && video != null && blocked.add(video.id)) {
+            if (!watchMode && video != null && context != null && OnlineStore.blocked(context).add(video.id)) {
+                OnlineStore.addBlocked(context, video.id)
                 watchToken += 1
-                loadWatchPage(video.id, positionSec)
+                loadWatchPage(video.id, 0.0)
                 armWatchTimeout(gen)
                 return@post
             }
-            val context = appContext
-            if (context != null) {
-                com.musicrage.app.Toaster.show(context, "This video can't be played")
+            // The watch page itself failed: fall back to the embed player for the next attempt.
+            if (watchMode && video != null) {
+                watchToken += 1
+                loadEmbedPage(web ?: return@post)
+                pendingLoad = video.id to positionSec
             }
+            // Several attempts failed in a row: stop trying instead of looping through the same
+            // failure (the "can't be played" toast spam).
+            failStreak += 1
+            if (failStreak >= 3) {
+                failStreak = 0
+                OnlineLoading.active = false
+                if (context != null) com.musicrage.app.Toaster.show(context, "This video can't be played")
+                stop(clearView = false)
+                return@post
+            }
+            if (context != null) com.musicrage.app.Toaster.show(context, "This video can't be played")
             if (index + 1 < queue.size) next() else {
+                OnlineLoading.active = false
                 state = state.copy(isPlaying = false)
                 listener?.invoke()
             }
@@ -672,11 +835,13 @@ object OnlinePlayer {
         generation += 1
         watchToken += 1
         jsPause()
+        OnlineLoading.active = false
         state = OnlineState()
         positionSec = 0.0
         durationSec = 0.0
         queue = emptyList()
         index = -1
+        failStreak = 0
         val context = appContext
         if (context != null) {
             OnlineStore.setAlive(context, false)
