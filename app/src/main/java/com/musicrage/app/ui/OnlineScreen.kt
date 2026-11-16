@@ -250,10 +250,12 @@ private fun OnlineNowPlaying(video: OnlineVideo, playing: Boolean) {
 @Composable
 private fun DownloadButton(video: OnlineVideo) {
     val preparing = OnlineApi.preparingId != null
+    // Read the context in the composable body; the click lambda is not a composable context.
+    val context = LocalContext.current
     Row(
         Modifier.clip(RoundedCornerShape(50))
             .background(if (preparing) Rage.SurfaceHigh else Rage.Accent)
-            .clickable(enabled = !preparing) { OnlineApi.startDownload(LocalContext.current, video) }
+            .clickable(enabled = !preparing) { OnlineApi.startDownload(context, video) }
             .padding(horizontal = 14.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
