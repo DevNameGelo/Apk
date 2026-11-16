@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.10
+- Fixed the Online spinner that kept spinning while the song was already playing: loading now ends as soon as the playback clock advances, not only when the page happens to send its "playing" event. The 25-second give-up timer also follows the real loading state now.
+- Fixed the false "This video can't be played" toast right after opening the app and when switching to a local song while online music was playing. Errors from the idle player page are ignored unless an online song is actually loading, and a song that is already audible is never interrupted by a stray error.
+- Downloads now recognise songs you already saved: tapping MP3 again says "Already downloaded", and the button shows a check and "Saved". If you delete the file, the button goes back to MP3.
+- Redesigned the Online tab: pill search, a tinted now-playing card (cover colour gradient, seek bar, controls, download state), a Continue playing shelf, thumbnail rows with an animated playing indicator, skeleton loading placeholders, a retry card for errors and a cleaner background-permission card. The mini bar got the same tint and a progress line.
+
 ## 1.2.9
 - Fixed the confusing toast spam: opening the app, starting online music or switching to a local song no longer fires "This video can't be played" and "Music Rage was closed in the background" at the same time. A failed recovery is now silent, and the local service only announces a real kill of its own session; the online service no longer "recovers" a video that was already replaced. Repeated embed failures now stop after three tries instead of looping.
 - A loading spinner now appears on the Online tab (on the cover, on the play button and in the mini player) while a song is still buffering, and disappears the moment it actually plays.

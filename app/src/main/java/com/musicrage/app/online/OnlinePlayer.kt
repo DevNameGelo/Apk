@@ -612,7 +612,7 @@ object OnlinePlayer {
     private fun armWatchTimeout(gen: Long = 0L) {
         val token = watchToken
         main.postDelayed({
-            if (token == watchToken && gen == generation && !state.isPlaying) {
+            if (token == watchToken && gen == generation && OnlineLoading.active) {
                 val context = appContext
                 if (context != null && state.video != null) {
                     com.musicrage.app.Toaster.show(context, "This video can't be played")
@@ -743,6 +743,13 @@ object OnlinePlayer {
             if (gen != generation) return@post
             positionSec = position
             durationSec = if (duration > 0.0) duration else durationSec
+            // The player is clearly playing once the clock advances. Some pages never send the "playing"
+            // event for this video, which left the spinner on forever while the song was audible.
+            if (OnlineLoading.active && position > 0.4 && state.video != null) {
+                OnlineLoading.active = false
+                failStreak = 0
+                listener?.invoke()
+            }
             val now = System.currentTimeMillis()
             val context = appContext
             if (context != null && state.isPlaying && now - lastSave > 5_000L) {
@@ -798,6 +805,11 @@ object OnlinePlayer {
             if (gen != generation) return@post
             val video = state.video
             val context = appContext
+            // No online song is loading (fresh start, or the local player just took over): an error from the
+            // idle page is not worth a toast.
+            if (video == null) return@post
+            // The song is already audible; a stray error from an old page must not interrupt it.
+            if (!OnlineLoading.active && state.isPlaying && positionSec > 1.0) return@post
             // Embedding is blocked or misconfigured for this video: play it from the normal watch page instead.
             if (!watchMode && video != null && context != null && !OnlineStore.blocked(context).contains(video.id)) {
                 OnlineStore.addBlocked(context, video.id)

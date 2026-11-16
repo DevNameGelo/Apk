@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
@@ -475,8 +476,27 @@ object OnlineApi {
     }
 
     /** Streams the MP3, embeds its metadata (title, artist, cover) and saves it into Music/Music Rage. */
+    /** File-system safe name used for the downloaded MP3 (also how a repeat download is recognised). */
+    fun safeName(video: OnlineVideo): String =
+        video.title.replace(Regex("[\\\\/:*?\"<>|]"), " ").replace(Regex("\\s+"), " ").trim().ifEmpty { "download" }.take(120)
+
+    /** True when this song's MP3 is already in Music/Music Rage (a deleted file counts as not downloaded). */
+    fun isDownloaded(context: Context, video: OnlineVideo): Boolean = runCatching {
+        context.contentResolver.query(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.Audio.Media._ID),
+            "${MediaStore.Audio.Media.DISPLAY_NAME} = ? AND ${MediaStore.Audio.Media.RELATIVE_PATH} LIKE ?",
+            arrayOf(safeName(video) + ".mp3", "Music/Music Rage%"),
+            null
+        )?.use { it.count > 0 } ?: false
+    }.getOrDefault(false)
+
+    /** Bumped after every finished download so the buttons re-check their state. */
+    var downloadVersion: Int by mutableIntStateOf(0)
+        private set
+
     fun saveMp3(context: Context, url: String, video: OnlineVideo) {
-        val safe = video.title.replace(Regex("[\\\\/:*?\"<>|]"), " ").replace(Regex("\\s+"), " ").trim().ifEmpty { "download" }.take(120)
+        val safe = safeName(video)
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Audio.Media.DISPLAY_NAME, "$safe.mp3")
@@ -599,6 +619,10 @@ object OnlineApi {
             say(context, "A download is already in progress")
             return
         }
+        if (isDownloaded(context, video)) {
+            say(context, "Already downloaded")
+            return
+        }
         preparingId = video.id
         downloadProgress = 0
         say(context, "Preparing download…")
@@ -615,6 +639,7 @@ object OnlineApi {
                 mainHandler.post {
                     preparingId = null
                     downloadProgress = -1
+                    downloadVersion += 1
                 }
             }
         }

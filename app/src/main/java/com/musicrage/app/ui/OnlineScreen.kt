@@ -1,6 +1,11 @@
 package com.musicrage.app.ui
 
 import android.graphics.Bitmap
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -10,7 +15,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -19,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.asImageBitmap
@@ -60,6 +66,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+// ---- Shared bits ------------------------------------------------------------------------------------------------
+
 @Composable
 fun NetImage(url: String, modifier: Modifier = Modifier, shape: Shape = RoundedCornerShape(6.dp)) {
     var bitmap by remember(url) { mutableStateOf<Bitmap?>(if (url.isEmpty()) null else ArtworkLoader.peekUrl(url)) }
@@ -71,12 +79,85 @@ fun NetImage(url: String, modifier: Modifier = Modifier, shape: Shape = RoundedC
         if (loaded != null) {
             Image(bitmap = loaded.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
         } else {
-            // Light shimmer placeholder while the thumbnail loads.
             Box(Modifier.fillMaxSize().background(placeholderBrush(url.hashCode())))
         }
     }
 }
 
+/** A dark, saturated tone taken from a web thumbnail; tints the now-playing card. */
+private fun tintOf(bitmap: Bitmap): Int {
+    val small = Bitmap.createScaledBitmap(bitmap, 16, 16, true)
+    var r = 0.0
+    var g = 0.0
+    var b = 0.0
+    var total = 0.0
+    val hsv = FloatArray(3)
+    for (y in 0 until small.height) {
+        for (x in 0 until small.width) {
+            val pixel = small.getPixel(x, y)
+            android.graphics.Color.colorToHSV(pixel, hsv)
+            val weight = (hsv[1] * hsv[2]).toDouble() + 0.04
+            r += android.graphics.Color.red(pixel) * weight
+            g += android.graphics.Color.green(pixel) * weight
+            b += android.graphics.Color.blue(pixel) * weight
+            total += weight
+        }
+    }
+    if (small !== bitmap) small.recycle()
+    val average = android.graphics.Color.rgb((r / total).toInt(), (g / total).toInt(), (b / total).toInt())
+    android.graphics.Color.colorToHSV(average, hsv)
+    hsv[1] = hsv[1].coerceAtMost(0.75f)
+    hsv[2] = hsv[2].coerceIn(0.26f, 0.5f)
+    return android.graphics.Color.HSVToColor(hsv)
+}
+
+@Composable
+private fun rememberUrlTint(url: String): Color {
+    var tint by remember(url) { mutableStateOf(Color(0xFF2A2433)) }
+    LaunchedEffect(url) {
+        if (url.isNotEmpty()) {
+            val value = withContext(Dispatchers.IO) { ArtworkLoader.loadUrl(url)?.let { runCatching { tintOf(it) }.getOrNull() } }
+            if (value != null) tint = Color(value)
+        }
+    }
+    return tint
+}
+
+@Composable
+private fun EqualizerBars(active: Boolean) {
+    val transition = rememberInfiniteTransition(label = "equalizer")
+    val first by transition.animateFloat(0.3f, 1f, infiniteRepeatable(tween(520), RepeatMode.Reverse), label = "first")
+    val second by transition.animateFloat(1f, 0.35f, infiniteRepeatable(tween(430), RepeatMode.Reverse), label = "second")
+    val third by transition.animateFloat(0.5f, 1f, infiniteRepeatable(tween(610), RepeatMode.Reverse), label = "third")
+    Row(Modifier.height(12.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        listOf(first, second, third).forEach { level ->
+            Box(
+                Modifier.width(3.dp).height(12.dp * (if (active) level else 0.35f))
+                    .clip(RoundedCornerShape(1.dp)).background(Rage.Accent)
+            )
+        }
+    }
+}
+
+@Composable
+private fun SkeletonRows(count: Int) {
+    val transition = rememberInfiniteTransition(label = "skeleton")
+    val alpha by transition.animateFloat(0.35f, 0.75f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "alpha")
+    Column {
+        repeat(count) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.width(120.dp).height(68.dp).clip(RoundedCornerShape(12.dp)).background(Rage.SurfaceHigh.copy(alpha = alpha)))
+                Column(Modifier.padding(start = 12.dp)) {
+                    Box(Modifier.fillMaxWidth(0.8f).height(12.dp).clip(RoundedCornerShape(6.dp)).background(Rage.SurfaceHigh.copy(alpha = alpha)))
+                    Spacer(Modifier.height(8.dp))
+                    Box(Modifier.fillMaxWidth(0.45f).height(10.dp).clip(RoundedCornerShape(5.dp)).background(Rage.SurfaceHigh.copy(alpha = alpha)))
+                }
+            }
+        }
+    }
+}
+
+// ---- Screen -----------------------------------------------------------------------------------------------------
 
 @Composable
 fun OnlineScreen(activity: MainActivity) {
@@ -84,252 +165,317 @@ fun OnlineScreen(activity: MainActivity) {
     var query by remember { mutableStateOf("") }
     var results by remember { mutableStateOf<List<OnlineVideo>?>(null) }
     var recommended by remember { mutableStateOf(emptyList<OnlineVideo>()) }
-    var loading by remember { mutableStateOf(false) }
+    var searching by remember { mutableStateOf(false) }
+    var loadingRecommended by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     val state = OnlinePlayer.state
     val current = state.video
     val history = remember(current?.id) { OnlineStore.history(activity) }
 
-    LaunchedEffect(Unit) {
-        if (recommended.isEmpty()) {
+    fun loadRecommended() {
+        scope.launch {
+            loadingRecommended = true
             try {
                 recommended = withContext(Dispatchers.IO) { OnlineApi.recommended() }
                 error = null
             } catch (e: Exception) {
                 error = e.message ?: "Could not load recommendations"
             }
+            loadingRecommended = false
         }
     }
 
     fun search() {
         val text = query.trim()
-        if (text.isEmpty()) return
+        if (text.isEmpty()) {
+            results = null
+            return
+        }
         scope.launch {
-            loading = true
+            searching = true
             error = null
             try {
                 results = withContext(Dispatchers.IO) { OnlineApi.search(text) }
             } catch (e: Exception) {
                 error = e.message ?: "Search failed"
             }
-            loading = false
+            searching = false
         }
     }
 
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 16.dp)) {
-        // ---- Header ----------------------------------------------------------------
+    LaunchedEffect(Unit) {
+        if (recommended.isEmpty()) loadRecommended()
+    }
+
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 20.dp)) {
+        // Header
         item {
-            Row(
-                Modifier.fillMaxWidth().statusBarsPadding().padding(start = 20.dp, end = 8.dp, top = 10.dp, bottom = 2.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Online", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Column(Modifier.fillMaxWidth().statusBarsPadding().padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 4.dp)) {
+                Text("Online", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                Text("Search and stream music", color = Rage.TextDim, fontSize = 13.sp)
             }
         }
 
-        // ---- Search bar ----------------------------------------------------------------
+        // Search
         item {
-            Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-                TextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    singleLine = true,
-                    placeholder = { Text("Search music", color = Rage.TextDim) },
-                    leadingIcon = { RIcon(R.drawable.ic_search, tint = Rage.TextDim, size = 20.dp) },
-                    trailingIcon = {
-                        if (query.isNotEmpty()) IconAction(R.drawable.ic_x, { query = "" }, tint = Rage.TextDim, size = 18.dp, contentDescription = "Clear")
-                    },
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions = KeyboardActions(onSearch = { search() }),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = Rage.SurfaceHigh,
-                        unfocusedContainerColor = Rage.SurfaceHigh,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        cursorColor = Rage.Accent,
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
+            TextField(
+                value = query,
+                onValueChange = { query = it },
+                singleLine = true,
+                placeholder = { Text("Songs, artists, albums", color = Rage.TextDim) },
+                leadingIcon = { RIcon(R.drawable.ic_search, tint = Rage.TextDim, size = 20.dp) },
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        IconAction(R.drawable.ic_x, { query = ""; results = null; error = null }, tint = Rage.TextDim, size = 18.dp, contentDescription = "Clear")
+                    }
+                },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { search() }),
+                shape = RoundedCornerShape(28.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = Rage.Surface,
+                    unfocusedContainerColor = Rage.Surface,
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    cursorColor = Rage.Accent,
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent
+                ),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)
+            )
         }
 
-        // ---- Now-playing card (thumbnail like the local player, never the video) ----
+        // Now playing
         if (current != null) {
-            item(key = "now-" + current.id) { OnlineNowPlaying(current, state.isPlaying) }
+            item(key = "now-playing") { OnlineNowPlaying(current, state.isPlaying) }
         }
 
-        // ---- Hint for background permission ----
+        // Background permission
         if (!OnlinePlayer.inOverlay && !OnlinePlayer.overlayAllowed()) {
-            item {
-                Text(
-                    "Tap here and allow \"Display over other apps\" so online music keeps playing when you switch tabs or close the app.",
-                    color = Rage.Accent,
-                    fontSize = 12.sp,
-                    modifier = Modifier.fillMaxWidth().clickable { activity.requestOverlayForPlayer() }.padding(horizontal = 20.dp, vertical = 6.dp)
-                )
+            item(key = "overlay-hint") {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(16.dp)).background(Rage.Surface)
+                        .padding(start = 14.dp, end = 10.dp, top = 10.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RIcon(R.drawable.ic_pip, tint = Rage.Accent, size = 22.dp)
+                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                        Text("Keep playing in the background", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        Text("Allow \"Display over other apps\"", color = Rage.TextDim, fontSize = 12.sp)
+                    }
+                    Box(
+                        Modifier.clip(RoundedCornerShape(50)).background(Rage.Accent)
+                            .clickable { activity.requestOverlayForPlayer() }.padding(horizontal = 14.dp, vertical = 7.dp)
+                    ) { Text("Allow", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                }
             }
         }
 
-        // ---- Results / sections ----
-        if (loading) item { OnlineSectionLabel("Searching…") }
+        // Error
         val message = error
-        if (message != null) item { OnlineMessage(message) }
+        if (message != null) {
+            item(key = "error") {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+                        .clip(RoundedCornerShape(16.dp)).background(Rage.Danger.copy(alpha = 0.12f))
+                        .padding(start = 14.dp, end = 10.dp, top = 10.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(message, color = Rage.Danger, fontSize = 13.sp, modifier = Modifier.weight(1f).padding(end = 10.dp), maxLines = 3, overflow = TextOverflow.Ellipsis)
+                    Box(
+                        Modifier.clip(RoundedCornerShape(50)).background(Color.White)
+                            .clickable { if (query.isNotBlank()) search() else loadRecommended() }.padding(horizontal = 14.dp, vertical = 7.dp)
+                    ) { Text("Retry", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                }
+            }
+        }
+
         val shown = results
-        if (shown != null) {
-            item { OnlineSectionLabel("Results") }
-            if (shown.isEmpty() && !loading) item { OnlineMessage("No results — try another search.") }
-            items(shown, key = { "r-" + it.id }) { video -> OnlineRow(video, current?.id == video.id) { OnlinePlayer.play(video, shown) } }
+        if (searching) {
+            item(key = "skeleton-search") {
+                OnlineSectionTitle("Searching")
+                SkeletonRows(5)
+            }
+        } else if (shown != null) {
+            item(key = "results-title") { OnlineSectionTitle("Results") }
+            if (shown.isEmpty()) {
+                item(key = "no-results") {
+                    Text("No results. Try another search.", color = Rage.TextDim, fontSize = 14.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp))
+                }
+            }
+            items(shown, key = { "r-" + it.id }) { video ->
+                OnlineRow(video, current?.id == video.id, state.isPlaying) { OnlinePlayer.play(video, shown) }
+            }
         } else {
             if (history.isNotEmpty()) {
-                item { OnlineSectionLabel("Continue playing") }
-                items(history, key = { "h-" + it.id }) { video -> OnlineRow(video, current?.id == video.id) { OnlinePlayer.play(video, history) } }
+                item(key = "history-title") { OnlineSectionTitle("Continue playing") }
+                item(key = "history-row") {
+                    LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        items(history, key = { "h-" + it.id }) { video ->
+                            OnlineShelfCard(video, current?.id == video.id) { OnlinePlayer.play(video, history) }
+                        }
+                    }
+                }
             }
-            if (recommended.isNotEmpty()) {
-                item { OnlineSectionLabel("Recommended") }
-                items(recommended, key = { "p-" + it.id }) { video -> OnlineRow(video, current?.id == video.id) { OnlinePlayer.play(video, recommended) } }
+            item(key = "recommended-title") { OnlineSectionTitle("Recommended") }
+            if (recommended.isEmpty() && loadingRecommended) {
+                item(key = "skeleton-recommended") { SkeletonRows(5) }
+            }
+            items(recommended, key = { "p-" + it.id }) { video ->
+                OnlineRow(video, current?.id == video.id, state.isPlaying) { OnlinePlayer.play(video, recommended) }
             }
         }
     }
 }
 
-/** The unified player card: cover art, title, progress and controls — same style as the local mini player. */
+// ---- Now playing card -------------------------------------------------------------------------------------------
+
 @Composable
 private fun OnlineNowPlaying(video: OnlineVideo, playing: Boolean) {
     val duration = OnlinePlayer.durationSec
     val position = OnlinePlayer.positionSec
     val loading = OnlineLoading.active
+    val tint = rememberUrlTint(video.thumb)
     var drag by remember { mutableStateOf<Float?>(null) }
     val live = if (duration > 0.0) (position / duration).toFloat().coerceIn(0f, 1f) else 0f
     val shown = drag ?: live
 
-    Column(
-        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Rage.Surface)
+    Box(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+            .clip(RoundedCornerShape(24.dp))
+            .background(Brush.verticalGradient(listOf(tint, Rage.Surface)))
     ) {
-        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            // Square cover, exactly like the local player's tiles. A spinner overlays it while loading.
-            Box {
-                NetImage(video.thumb, Modifier.size(64.dp), RoundedCornerShape(8.dp))
-                if (loading) {
-                    Box(Modifier.size(64.dp).clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(alpha = 0.45f)), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(color = Rage.Accent, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box {
+                    NetImage(video.thumb, Modifier.size(80.dp), RoundedCornerShape(14.dp))
+                    if (loading) {
+                        Box(
+                            Modifier.size(80.dp).clip(RoundedCornerShape(14.dp)).background(Color.Black.copy(alpha = 0.5f)),
+                            contentAlignment = Alignment.Center
+                        ) { CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(24.dp)) }
                     }
                 }
-            }
-            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                Text(video.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Spacer(Modifier.height(3.dp))
-                Text(if (loading) "Loading…" else video.channel, color = Rage.TextDim, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
-        OnlineProgress(
-            fraction = shown,
-            enabled = duration > 0.0,
-            onSeek = { drag = it },
-            onSeekFinished = {
-                OnlinePlayer.seekTo(duration * it)
-                drag = null
-            },
-            position = position,
-            duration = duration
-        )
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconAction(R.drawable.ic_skip_prev, { OnlinePlayer.previous() }, size = 24.dp, contentDescription = "Previous")
-            Spacer(Modifier.weight(1f))
-            Box(
-                Modifier.size(54.dp).clip(CircleShape).background(Color.White).clickable { OnlinePlayer.toggle() },
-                contentAlignment = Alignment.Center
-            ) {
-                if (loading) {
-                    CircularProgressIndicator(color = Color.Black, strokeWidth = 2.5.dp, modifier = Modifier.size(26.dp))
-                } else {
-                    RIcon(if (playing) R.drawable.ic_pause else R.drawable.ic_play, tint = Color.Black, size = 24.dp)
+                Column(Modifier.weight(1f).padding(start = 14.dp)) {
+                    Text(video.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        if (loading) "Loading…" else video.channel,
+                        color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
-            Spacer(Modifier.weight(1f))
-            IconAction(R.drawable.ic_skip_next, { OnlinePlayer.next() }, size = 24.dp, contentDescription = "Next")
-            Spacer(Modifier.weight(2f))
-            DownloadButton(video)
+            Spacer(Modifier.height(10.dp))
+            SeekBar(
+                fraction = shown,
+                enabled = duration > 0.0,
+                onSeek = { drag = it },
+                onSeekFinished = {
+                    OnlinePlayer.seekTo(duration * it)
+                    drag = null
+                }
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(formatDuration(((if (drag != null) duration * shown else position) * 1000).toLong()), color = Color.White.copy(alpha = 0.65f), fontSize = 11.sp)
+                Text(formatDuration((duration * 1000).toLong()), color = Color.White.copy(alpha = 0.65f), fontSize = 11.sp)
+            }
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                IconAction(R.drawable.ic_skip_prev, { OnlinePlayer.previous() }, size = 26.dp, contentDescription = "Previous")
+                Spacer(Modifier.width(6.dp))
+                Box(
+                    Modifier.size(58.dp).clip(CircleShape).background(Color.White).clickable { OnlinePlayer.toggle() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (loading) {
+                        CircularProgressIndicator(color = Color.Black, strokeWidth = 2.5.dp, modifier = Modifier.size(26.dp))
+                    } else {
+                        RIcon(if (playing) R.drawable.ic_pause else R.drawable.ic_play, tint = Color.Black, size = 26.dp, contentDescription = if (playing) "Pause" else "Play")
+                    }
+                }
+                Spacer(Modifier.width(6.dp))
+                IconAction(R.drawable.ic_skip_next, { OnlinePlayer.next() }, size = 26.dp, contentDescription = "Next")
+                Spacer(Modifier.weight(1f))
+                DownloadButton(video)
+            }
         }
     }
 }
 
 @Composable
 private fun DownloadButton(video: OnlineVideo) {
-    val preparing = OnlineApi.preparingId != null
-    val progress = OnlineApi.downloadProgress
-    // Read the context in the composable body; the click lambda is not a composable context.
     val context = LocalContext.current
+    val version = OnlineApi.downloadVersion
+    var downloaded by remember(video.id, version) { mutableStateOf(false) }
+    LaunchedEffect(video.id, version) {
+        downloaded = withContext(Dispatchers.IO) { OnlineApi.isDownloaded(context, video) }
+    }
+    val mine = OnlineApi.preparingId == video.id
+    val busy = OnlineApi.preparingId != null
+    val progress = OnlineApi.downloadProgress
+    val background = when {
+        downloaded && !mine -> Color.White.copy(alpha = 0.14f)
+        busy -> Color.White.copy(alpha = 0.14f)
+        else -> Rage.Accent
+    }
+    val foreground = if (downloaded || busy) Color.White else Color.Black
     Row(
-        Modifier.clip(RoundedCornerShape(50))
-            .background(if (preparing) Rage.SurfaceHigh else Rage.Accent)
-            .clickable(enabled = !preparing) { OnlineApi.startDownload(context, video) }
-            .padding(horizontal = 14.dp, vertical = 9.dp),
+        Modifier.clip(RoundedCornerShape(50)).background(background)
+            .clickable(enabled = !busy) { OnlineApi.startDownload(context, video) }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        RIcon(R.drawable.ic_download, tint = if (preparing) Rage.TextDim else Color.Black, size = 17.dp)
-        Spacer(Modifier.width(6.dp))
+        RIcon(if (downloaded && !mine) R.drawable.ic_check else R.drawable.ic_download, tint = foreground, size = 17.dp)
+        Spacer(Modifier.width(7.dp))
         Text(
             when {
-                preparing && progress >= 0 -> "$progress%"
-                preparing -> "…"
+                mine && progress >= 0 -> "$progress%"
+                mine -> "…"
+                downloaded -> "Saved"
                 else -> "MP3"
             },
-            color = if (preparing) Rage.TextDim else Color.Black,
-            fontWeight = FontWeight.Bold,
-            fontSize = 13.sp
+            color = foreground, fontWeight = FontWeight.Bold, fontSize = 13.sp
         )
     }
 }
 
-@Composable
-private fun OnlineProgress(fraction: Float, enabled: Boolean, onSeek: (Float) -> Unit, onSeekFinished: (Float) -> Unit, position: Double, duration: Double) {
-    Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp)) {
-        SeekBar(
-            fraction = fraction,
-            enabled = enabled,
-            onSeek = onSeek,
-            onSeekFinished = onSeekFinished
-        )
-        Row(Modifier.fillMaxWidth().padding(top = 0.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(formatDuration((position * 1000).toLong()), color = Rage.TextDim, fontSize = 11.sp)
-            Text(formatDuration((duration * 1000).toLong()), color = Rage.TextDim, fontSize = 11.sp)
-        }
-    }
-}
+// ---- Lists ------------------------------------------------------------------------------------------------------
 
 @Composable
-private fun OnlineSectionLabel(text: String) {
+private fun OnlineSectionTitle(text: String) {
     Text(
         text,
         color = Color.White,
-        fontSize = 13.sp,
+        fontSize = 20.sp,
         fontWeight = FontWeight.Bold,
-        letterSpacing = 1.1.sp,
-        modifier = Modifier.padding(start = 20.dp, top = 18.dp, bottom = 6.dp)
+        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 8.dp)
     )
 }
 
 @Composable
-private fun OnlineMessage(text: String) {
-    Text(text, color = Rage.TextDim, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp))
+private fun OnlineShelfCard(video: OnlineVideo, isCurrent: Boolean, onClick: () -> Unit) {
+    Column(Modifier.width(156.dp).clickable(onClick = onClick)) {
+        NetImage(video.thumb, Modifier.width(156.dp).height(88.dp), RoundedCornerShape(14.dp))
+        Spacer(Modifier.height(8.dp))
+        Text(
+            video.title,
+            color = if (isCurrent) Rage.Accent else Color.White,
+            fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(video.channel, color = Rage.TextDim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
 }
 
 @Composable
-private fun OnlineRow(video: OnlineVideo, isCurrent: Boolean, onClick: () -> Unit) {
+private fun OnlineRow(video: OnlineVideo, isCurrent: Boolean, playing: Boolean, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 7.dp),
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        NetImage(video.thumb, Modifier.width(104.dp).height(58.dp), RoundedCornerShape(8.dp))
-        Column(Modifier.weight(1f).padding(start = 12.dp)) {
+        NetImage(video.thumb, Modifier.width(120.dp).height(68.dp), RoundedCornerShape(12.dp))
+        Column(Modifier.weight(1f).padding(start = 14.dp)) {
             Text(
                 video.title,
                 color = if (isCurrent) Rage.Accent else Color.White,
@@ -338,14 +484,11 @@ private fun OnlineRow(video: OnlineVideo, isCurrent: Boolean, onClick: () -> Uni
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
-            Spacer(Modifier.height(3.dp))
+            Spacer(Modifier.height(4.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (isCurrent) {
-                    // Tiny "playing" bars instead of plain accent text.
-                    Box(
-                        Modifier.width(3.dp).height(10.dp).clip(RoundedCornerShape(2.dp)).background(Rage.Accent)
-                    )
-                    Spacer(Modifier.width(5.dp))
+                    EqualizerBars(playing)
+                    Spacer(Modifier.width(6.dp))
                 }
                 Text(video.channel, color = Rage.TextDim, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
@@ -353,27 +496,42 @@ private fun OnlineRow(video: OnlineVideo, isCurrent: Boolean, onClick: () -> Uni
     }
 }
 
+// ---- Mini bar ---------------------------------------------------------------------------------------------------
+
 /** Compact controls shown above the bottom bar while online music plays and another tab is open. */
 @Composable
 fun OnlineMiniBar(onOpen: () -> Unit) {
     val state = OnlinePlayer.state
     val video = state.video ?: return
     val loading = OnlineLoading.active
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp).clip(RoundedCornerShape(10.dp))
-            .background(Rage.SurfaceHigh).clickable(onClick = onOpen).padding(start = 8.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-        verticalAlignment = Alignment.CenterVertically
+    val tint = rememberUrlTint(video.thumb)
+    Box(
+        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(12.dp)).background(tint).clickable(onClick = onOpen)
     ) {
-        NetImage(video.thumb, Modifier.size(width = 64.dp, height = 36.dp), RoundedCornerShape(5.dp))
-        Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-            Text(video.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(if (loading) "Loading…" else "Online · " + video.channel, color = Rage.TextDim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Row(
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp, top = 8.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            NetImage(video.thumb, Modifier.size(42.dp), RoundedCornerShape(8.dp))
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text(video.title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    if (loading) "Loading…" else "Online · " + video.channel,
+                    color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (loading) {
+                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.padding(end = 14.dp).size(20.dp))
+            } else {
+                IconAction(if (state.isPlaying) R.drawable.ic_pause else R.drawable.ic_play, { OnlinePlayer.toggle() }, size = 24.dp, contentDescription = "Play or pause")
+            }
+            IconAction(R.drawable.ic_skip_next, { OnlinePlayer.next() }, size = 24.dp, contentDescription = "Next")
         }
-        if (loading) {
-            CircularProgressIndicator(color = Rage.Accent, strokeWidth = 2.dp, modifier = Modifier.padding(end = 12.dp).size(18.dp))
-        } else {
-            IconAction(if (state.isPlaying) R.drawable.ic_pause else R.drawable.ic_play, { OnlinePlayer.toggle() }, size = 22.dp, contentDescription = "Play or pause")
+        val duration = OnlinePlayer.durationSec
+        val fraction = if (duration > 0.0) (OnlinePlayer.positionSec / duration).toFloat().coerceIn(0f, 1f) else 0f
+        Box(Modifier.align(Alignment.BottomStart).fillMaxWidth().height(2.dp).background(Color.White.copy(alpha = 0.2f))) {
+            Box(Modifier.fillMaxWidth(fraction).height(2.dp).background(Color.White))
         }
-        IconAction(R.drawable.ic_skip_next, { OnlinePlayer.next() }, size = 22.dp, contentDescription = "Next")
     }
 }

@@ -128,7 +128,7 @@ jobs:
 
           readme = Path("build-distribution/BUILD-INFO.txt")
           readme.write_text(
-              "Music Rage 1.2.9 - GitHub Actions release build\n"
+              "Music Rage 1.2.10 - GitHub Actions release build\n"
               "Application ID: com.musicrage.app\n"
               "Minimum Android: 10 (API 29)\n"
               "Primary device build: arm64-v8a\n"
