@@ -400,6 +400,7 @@ object OnlineApi {
     /** auth -> init -> convert (-> redirect) (-> progress). Returns the final MP3 link. Call off the main thread. */
     fun prepareMp3(videoId: String): String {
         val id = encode(videoId)
+        setProgress(5)
 
         // 1. Auth. Tried without a key first, then with the saved one.
         var token = ""
@@ -417,11 +418,13 @@ object OnlineApi {
             }
         }
         if (token.isBlank()) throw ApiException("Auth failed: $authProblem")
+        setProgress(12)
 
         // 2. Init.
         val init = step("Init") { JSONObject(get("$CONVERT_HOST/init?_=${clock()}", browser = true, headers = siteHeaders(token))) }
         val convertUrl = init.optString("convertURL")
         if (convertUrl.isBlank()) throw ApiException("Init failed: ${serverError(init) ?: "no convert address returned"}")
+        setProgress(20)
 
         // 3. Convert.
         val convert = step("Convert") {
@@ -430,6 +433,7 @@ object OnlineApi {
         var progressUrl = convert.optString("progressURL")
         var downloadUrl = convert.optString("downloadURL")
         var lastReply = convert
+        setProgress(30)
 
         // 3b. Some replies point to one more address that holds the real links.
         val redirectUrl = convert.optString("redirectURL")
@@ -443,12 +447,19 @@ object OnlineApi {
             throw ApiException("Convert failed: ${serverError(lastReply) ?: serverError(convert) ?: "the server returned no download link"}")
         }
 
-        // 4. Wait until the server says the file is ready.
+        // 4. Wait until the server says the file is ready. The converter's own 0..3 progress maps to 35..95 %.
         if (progressUrl.isNotBlank()) {
             val deadline = clock() + 150_000L
+            var lastPercent = -1
             while (true) {
                 val progress = step("Progress") { JSONObject(get(progressUrl, browser = true, headers = siteHeaders())) }
-                if (progress.optInt("progress", 0) >= 3) break
+                val stepValue = progress.optInt("progress", 0)
+                val percent = 35 + ((stepValue.coerceIn(0, 3) * 60) / 3)
+                if (percent != lastPercent) {
+                    lastPercent = percent
+                    setProgress(percent)
+                }
+                if (stepValue >= 3) break
                 val failure = progress.opt("error")
                 val failureText = when (failure) {
                     is JSONObject -> failure.optString("message")
@@ -498,12 +509,20 @@ object OnlineApi {
                     throw ApiException("Download failed: the server sent text instead of audio (" + errorMessage(body, code) + ")")
                 }
                 val buffer = java.io.ByteArrayOutputStream()
+                val contentLength = connection.contentLength
+                var received = 0L
                 connection.inputStream.use { input ->
                     val chunk = ByteArray(32 * 1024)
                     while (true) {
                         val read = input.read(chunk)
                         if (read < 0) break
                         buffer.write(chunk, 0, read)
+                        received += read
+                        if (contentLength > 0) {
+                            // Real byte-level progress during the transfer; monotonic so it continues
+                            // from where the converter phase ended instead of jumping back.
+                            setProgressAtLeast(95 + ((received * 5) / contentLength).toInt().coerceAtMost(5))
+                        }
                     }
                 }
                 val raw = buffer.toByteArray()
@@ -551,11 +570,27 @@ object OnlineApi {
     var preparingId: String? by mutableStateOf(null)
         private set
 
+    /** Progress of the running download, 0..100. -1 while only "preparing" (no percentage yet). */
+    var downloadProgress: Int by mutableStateOf(-1)
+        private set
+
     private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private fun say(context: Context, message: String) {
         mainHandler.post { com.musicrage.app.Toaster.show(context, message, long = true) }
+    }
+
+    private fun setProgress(value: Int) {
+        mainHandler.post { downloadProgress = value.coerceIn(0, 100) }
+    }
+
+    /** Like [setProgress] but never goes backwards: the transfer phase must continue from where the converter ended. */
+    private fun setProgressAtLeast(value: Int) {
+        val target = value.coerceIn(0, 100)
+        mainHandler.post {
+            if (target > downloadProgress) downloadProgress = target
+        }
     }
 
     /** Starts a download that keeps going even if the person leaves the Online tab. */
@@ -565,17 +600,22 @@ object OnlineApi {
             return
         }
         preparingId = video.id
+        downloadProgress = 0
         say(context, "Preparing download…")
         downloadScope.launch {
             try {
                 val link = prepareMp3(video.id)
                 say(context, "Downloading…")
                 saveMp3(context, link, video)
+                setProgress(100)
                 say(context, "Saved to Music/Music Rage")
             } catch (e: Exception) {
                 say(context, e.message?.takeIf { it.isNotBlank() } ?: "Download failed")
             } finally {
-                mainHandler.post { preparingId = null }
+                mainHandler.post {
+                    preparingId = null
+                    downloadProgress = -1
+                }
             }
         }
     }

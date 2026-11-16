@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.8
+- Playing a local song while online music is playing now pauses the online player completely: it stands down, its bar disappears and the local player takes over the notification — before, the online bar stayed on screen forever and the local player looked like it "didn't play".
+- Switching to another online song always starts it at 0:00. Late progress reports from the previous video used to overwrite the new track's position and even make the watch-page fallback resume at the old timestamp (the "skips to 50 seconds" bug).
+- The download button now shows a live percentage, 0% to 100%: converter progress during preparation and real byte-level progress while the MP3 is transferred.
+- A welcome screen is shown on a brand-new install: what the app does, where downloads go, and "Made by Angelo". Settings → About now credits "Made by Angelo" too.
+- The online service fully clears the player state when it stops, so a dead online bar can no longer reappear after the app is killed and restarted.
+
 ## 1.2.7
 - One media notification instead of two: local and online playback now share a single notification owner, so the Online tab player and the local player can never both claim the shade or the headset buttons at the same time.
 - The Online tab was redesigned: a clean modern layout with a rounded now-playing card (cover, title, channel, seek bar, controls and download) that matches the local player style — the YouTube video itself is never shown in the app any more; the player bar below the tabs now shows whichever player is active (online included).

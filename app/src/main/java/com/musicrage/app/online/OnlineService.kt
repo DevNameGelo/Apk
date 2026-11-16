@@ -44,7 +44,7 @@ class OnlineService : Service() {
             }
             // The local player took over the single media notification: go silent and stop.
             if (PlaybackSupervisor.current() == PlaybackSupervisor.Owner.LOCAL) {
-                OnlinePlayer.pause()
+                OnlinePlayer.stop()
                 stopSelf()
                 return
             }
@@ -90,6 +90,14 @@ class OnlineService : Service() {
             ACTION_TOGGLE -> OnlinePlayer.toggle()
             ACTION_NEXT -> OnlinePlayer.next()
             ACTION_PREVIOUS -> OnlinePlayer.previous()
+            ACTION_STAND_DOWN -> {
+                // The local player owns the notification now: hide ours and stop. Playback state was
+                // already cleared by the supervisor, so the service must not re-post anything.
+                OnlinePlayer.pause()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return START_NOT_STICKY
+            }
             ACTION_RECOVER -> {
                 refresh(force = true)
                 if (!recovering && !OnlinePlayer.state.isPlaying) beginRecovery()
@@ -109,7 +117,9 @@ class OnlineService : Service() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         OnlinePlayer.listener = null
-        OnlinePlayer.pause()
+        // A full clear (not just a pause): the service is going away, so no video may keep "playing"
+        // in the UI after this. If local music owns the notification this was already done by the supervisor.
+        if (PlaybackSupervisor.current() != PlaybackSupervisor.Owner.ONLINE) OnlinePlayer.stop()
         OnlinePlayer.releaseHost()
         OnlineStore.setAlive(this, false)
         cancelWatchdog()
@@ -242,6 +252,7 @@ class OnlineService : Service() {
         const val ACTION_NEXT = "com.musicrage.app.online.NEXT"
         const val ACTION_PREVIOUS = "com.musicrage.app.online.PREVIOUS"
         const val ACTION_RECOVER = "com.musicrage.app.online.RECOVER"
+        const val ACTION_STAND_DOWN = "com.musicrage.app.online.STAND_DOWN"
         private const val CHANNEL = "music_rage_online"
         private const val NOTIFICATION_ID = 2002
     }

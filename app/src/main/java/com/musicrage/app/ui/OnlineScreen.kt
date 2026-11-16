@@ -250,6 +250,7 @@ private fun OnlineNowPlaying(video: OnlineVideo, playing: Boolean) {
 @Composable
 private fun DownloadButton(video: OnlineVideo) {
     val preparing = OnlineApi.preparingId != null
+    val progress = OnlineApi.downloadProgress
     // Read the context in the composable body; the click lambda is not a composable context.
     val context = LocalContext.current
     Row(
@@ -262,7 +263,11 @@ private fun DownloadButton(video: OnlineVideo) {
         RIcon(R.drawable.ic_download, tint = if (preparing) Rage.TextDim else Color.Black, size = 17.dp)
         Spacer(Modifier.width(6.dp))
         Text(
-            if (preparing) "…" else "MP3",
+            when {
+                preparing && progress >= 0 -> "$progress%"
+                preparing -> "…"
+                else -> "MP3"
+            },
             color = if (preparing) Rage.TextDim else Color.Black,
             fontWeight = FontWeight.Bold,
             fontSize = 13.sp

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Handler
 import android.os.Looper
 import com.musicrage.app.online.OnlinePlayer
+import com.musicrage.app.online.OnlineService
 
 /**
  * Decides which of the two players owns the ONE media notification.
@@ -38,8 +39,10 @@ object PlaybackSupervisor {
                 context.startService(Intent(context, PlaybackService::class.java).setAction(PlaybackService.ACTION_SYNC_ONLINE))
             }
             Owner.LOCAL -> runCatching {
-                // The online service stops itself when local playback takes over.
-                handler.post { OnlinePlayer.pauseForTakeover() }
+                // The online player fully stands down: paused AND cleared, so the local player's bar,
+                // notification and controls are the only ones the user sees from now on.
+                handler.post { OnlinePlayer.stop() }
+                context.startService(Intent(context, OnlineService::class.java).setAction(OnlineService.ACTION_STAND_DOWN))
             }
         }
     }

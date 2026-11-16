@@ -737,8 +737,9 @@ fun SettingsScreen(activity: MainActivity, songCount: Int, onBack: () -> Unit, o
         item { SettingsGroup("About") }
         item {
             Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
-                Text("Music Rage 1.2.6", color = Color.White, fontSize = 15.sp)
-                Text("Offline music player", color = Rage.TextDim, fontSize = 13.sp)
+                Text("Music Rage 1.2.8", color = Color.White, fontSize = 15.sp)
+                Text("Made by Angelo", color = Rage.Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Text("Offline and online music player", color = Rage.TextDim, fontSize = 13.sp)
             }
         }
     }

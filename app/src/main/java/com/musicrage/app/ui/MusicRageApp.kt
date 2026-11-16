@@ -11,11 +11,16 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -29,6 +34,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -73,6 +79,9 @@ fun MusicRageApp(activity: MainActivity) {
     var renamePlaylist by remember { mutableStateOf<MusicPlaylist?>(null) }
     var deleteTracks by remember { mutableStateOf<List<AudioTrack>?>(null) }
     var deletePlaylist by remember { mutableStateOf<MusicPlaylist?>(null) }
+
+    // First launch only: a short welcome before anything else is shown.
+    var showWelcome by remember { mutableStateOf(!MusicPreferences.welcomed(activity)) }
 
     val permissionGranted = activity.audioPermissionState.value
 
@@ -181,6 +190,14 @@ fun MusicRageApp(activity: MainActivity) {
         }
     }
     BackHandler(enabled = nowPlayingOpen) { nowPlayingOpen = false }
+
+    if (showWelcome) {
+        WelcomeScreen(onStart = {
+            MusicPreferences.setWelcomed(activity)
+            showWelcome = false
+        })
+        return
+    }
 
     Box(Modifier.fillMaxSize().background(Rage.Bg)) {
         Column(Modifier.fillMaxSize()) {
@@ -428,9 +445,66 @@ fun MusicRageApp(activity: MainActivity) {
     }
 }
 
+/** First-launch welcome: what the app does, where music goes, and who made it. */
 @Composable
-private fun ConfirmDialog(title: String, body: String, confirm: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
-    AlertDialog(
+private fun WelcomeScreen(onStart: () -> Unit) {
+    Box(
+        Modifier.fillMaxSize().background(Rage.Bg).statusBarsPadding().navigationBarsPadding(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                Modifier.size(84.dp).clip(CircleShape).background(Rage.Accent.copy(alpha = 0.16f)),
+                contentAlignment = Alignment.Center
+            ) {
+                RIcon(R.drawable.ic_stat_music, tint = Rage.Accent, size = 40.dp)
+            }
+            Spacer(Modifier.height(18.dp))
+            Text("Welcome to Music Rage", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            Text("Made by Angelo", color = Rage.Accent, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(22.dp))
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Rage.Surface).padding(18.dp)) {
+                WelcomeRow(R.drawable.ic_music, "Your offline library", "Play the music already on this device. Playlists, favorites and a player built for speed.")
+                Spacer(Modifier.height(14.dp))
+                WelcomeRow(R.drawable.ic_globe, "Online music too", "Search and stream from the Online tab, and save any song as an MP3 right into your library.")
+                Spacer(Modifier.height(14.dp))
+                WelcomeRow(R.drawable.ic_zap, "Keeps playing", "Music continues in the background, and recovers itself if Android closes the app.")
+            }
+            Spacer(Modifier.height(26.dp))
+            Box(
+                Modifier.fillMaxWidth().height(52.dp).clip(RoundedCornerShape(50))
+                    .background(Rage.Accent).clickable(onClick = onStart),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("Get started", color = Color.Black, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun WelcomeRow(icon: Int, title: String, body: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier.size(40.dp).clip(CircleShape).background(Rage.Accent.copy(alpha = 0.14f)),
+            contentAlignment = Alignment.Center
+        ) {
+            RIcon(icon, tint = Rage.Accent, size = 20.dp)
+        }
+        Column(Modifier.weight(1f).padding(start = 12.dp)) {
+            Text(title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(2.dp))
+            Text(body, color = Rage.TextDim, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun ConfirmDialog(title: String, body: String, confirm: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {    AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Rage.SurfaceHigh,
         title = { Text(title, color = Color.White, fontWeight = FontWeight.Bold) },

@@ -20,6 +20,7 @@ object MusicPreferences {
     private const val FLOATING_X = "floating_x"
     private const val FLOATING_Y = "floating_y"
     private const val TITLE_OVERRIDES = "title_overrides"
+    private const val WELCOMED = "welcomed"
 
     private fun prefs(context: Context) = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
@@ -113,6 +114,12 @@ object MusicPreferences {
     fun floatingEnabled(context: Context) = prefs(context).getBoolean(FLOATING, false)
     fun setFloatingEnabled(context: Context, value: Boolean) {
         prefs(context).edit().putBoolean(FLOATING, value).apply()
+    }
+
+    /** True until the app has shown its welcome screen once (a brand-new install). */
+    fun welcomed(context: Context) = prefs(context).getBoolean(WELCOMED, false)
+    fun setWelcomed(context: Context) {
+        prefs(context).edit().putBoolean(WELCOMED, true).apply()
     }
 
     fun floatingPosition(context: Context): Pair<Int, Int>? {

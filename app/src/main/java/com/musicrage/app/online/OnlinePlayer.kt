@@ -78,6 +78,11 @@ object OnlineStore {
         prefs(context).edit().putFloat(KEY_POSITION, positionSec.toFloat()).apply()
     }
 
+    /** Removes the "continue playing" pointer so a stopped player cannot be resurrected by mistake. */
+    fun clearLast(context: Context) {
+        prefs(context).edit().remove(KEY_LAST).remove(KEY_POSITION).apply()
+    }
+
     fun loadLast(context: Context): Pair<OnlineVideo, Double>? {
         val raw = prefs(context).getString(KEY_LAST, null) ?: return null
         val video = runCatching { fromJson(JSONObject(raw)) }.getOrNull() ?: return null
@@ -238,6 +243,14 @@ object OnlinePlayer {
     private var watchMode = false
     private var watchToken = 0
     private val blocked = HashSet<String>()
+
+    /**
+     * Rises every time a new video starts or playback is stopped. Events still arriving from the page
+     * (the JS interval keeps reporting the OLD video while the new one loads) carry an older generation
+     * and are dropped — this is what made a new track inherit the previous track's position
+     * ("skip to 50 seconds") and what could re-light a player the user had just replaced.
+     */
+    private var generation = 0L
 
     var state by mutableStateOf(OnlineState())
         private set
@@ -463,6 +476,9 @@ object OnlinePlayer {
     private fun startVideo(video: OnlineVideo, startSec: Double, startService: Boolean) {
         if (!Regex("[A-Za-z0-9_-]{6,20}").matches(video.id)) return
         val context = appContext ?: return
+        // Any event still on its way from the previous video is now obsolete.
+        generation += 1
+        val gen = generation
         // Claim the single media notification before anything starts.
         com.musicrage.app.playback.PlaybackSupervisor.claim(context, com.musicrage.app.playback.PlaybackSupervisor.Owner.ONLINE)
         state = OnlineState(video, isPlaying = true, hasPrev = index > 0, hasNext = index < queue.size - 1)
@@ -479,7 +495,7 @@ object OnlinePlayer {
         pendingLoad = null
         if (blocked.contains(video.id)) {
             main.post { loadWatchPage(video.id, startSec) }
-            armWatchTimeout()
+            armWatchTimeout(gen)
         } else {
             if (watchMode) main.post { loadEmbedPage(view) }
             if (pageReady && !watchMode) {
@@ -492,10 +508,10 @@ object OnlinePlayer {
     }
 
     /** If even the watch page never starts, give up on this video and move on. */
-    private fun armWatchTimeout() {
+    private fun armWatchTimeout(gen: Long = 0L) {
         val token = watchToken
         main.postDelayed({
-            if (token == watchToken && !state.isPlaying) {
+            if (token == watchToken && gen == generation && !state.isPlaying) {
                 val context = appContext
                 if (context != null) com.musicrage.app.Toaster.show(context, "This video can't be played")
                 if (index + 1 < queue.size) next() else {
@@ -561,7 +577,11 @@ object OnlinePlayer {
     }
 
     internal fun handleState(code: Int) {
+        // Capture the generation on the WebView thread, before the hop to the main thread.
+        val gen = generation
         main.post {
+            // The user started another video or stopped playback while this event was in flight: drop it.
+            if (gen != generation) return@post
             val context = appContext
             when (code) {
                 1 -> {
@@ -607,7 +627,12 @@ object OnlinePlayer {
     }
 
     internal fun handleTime(position: Double, duration: Double) {
+        // Capture the generation on the WebView thread, before the hop to the main thread.
+        val gen = generation
         main.post {
+            // Reports from the previous video (still ticking while the new one loads) must not
+            // overwrite the new track's position — that was the "skips to 50 seconds" bug.
+            if (gen != generation) return@post
             positionSec = position
             durationSec = if (duration > 0.0) duration else durationSec
             val now = System.currentTimeMillis()
@@ -620,13 +645,15 @@ object OnlinePlayer {
     }
 
     internal fun handleError(code: Int) {
+        val gen = generation
         main.post {
+            if (gen != generation) return@post
             val video = state.video
             // Embedding is blocked or misconfigured for this video: play it from the normal watch page instead.
             if (!watchMode && video != null && blocked.add(video.id)) {
                 watchToken += 1
                 loadWatchPage(video.id, positionSec)
-                armWatchTimeout()
+                armWatchTimeout(gen)
                 return@post
             }
             val context = appContext
@@ -638,5 +665,29 @@ object OnlinePlayer {
                 listener?.invoke()
             }
         }
+    }
+
+    /** Full stop used when the LOCAL player takes over: clears state so the app shows the local player again. */
+    fun stop(clearView: Boolean = true) {
+        generation += 1
+        watchToken += 1
+        jsPause()
+        state = OnlineState()
+        positionSec = 0.0
+        durationSec = 0.0
+        queue = emptyList()
+        index = -1
+        val context = appContext
+        if (context != null) {
+            OnlineStore.setAlive(context, false)
+            OnlineStore.savePosition(context, 0.0)
+            OnlineStore.clearLast(context)
+            if (clearView && watchMode) {
+                // Put the WebView back to a clean embed page so a later start never resumes the old video.
+                pendingLoad = null
+                web?.let { loadEmbedPage(it) }
+            }
+        }
+        listener?.invoke()
     }
 }
