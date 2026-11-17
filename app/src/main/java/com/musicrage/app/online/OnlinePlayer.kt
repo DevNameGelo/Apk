@@ -173,7 +173,7 @@ object OnlineStore {
             kept.forEach { array.put(toJson(it)) }
             p.edit().putString(KEY_HISTORY, array.toString()).apply()
         }
-        val last = runCatching { loadLast(context) }
+        val last = loadLast(context)
         if (last != null && !numeric.matches(last.first.id)) {
             p.edit().remove(KEY_LAST).remove(KEY_POSITION).putBoolean(KEY_ALIVE, false).apply()
         }
