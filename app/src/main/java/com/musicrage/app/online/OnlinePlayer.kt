@@ -107,6 +107,16 @@ object OnlineStore {
             val array = JSONArray(raw)
             buildList<OnlineVideo> { for (i in 0 until array.length()) add(fromJson(array.getJSONObject(i))) }
         }.getOrDefault(emptyList())
+            // Placeholder entries from older builds ("Playing next") are dropped; one entry per video.
+            .filter { it.title != "Playing next" && it.id.isNotEmpty() }
+            .distinctBy { it.id }
+    }
+
+    /** Removes a song from "Continue playing". Playing it again adds it back. */
+    fun removeHistory(context: Context, id: String) {
+        val array = JSONArray()
+        history(context).filter { it.id != id }.forEach { array.put(toJson(it)) }
+        prefs(context).edit().putString(KEY_HISTORY, array.toString()).apply()
     }
 
     fun addHistory(context: Context, video: OnlineVideo) {
@@ -131,6 +141,70 @@ object OnlineStore {
     }
 
     private const val KEY_BLOCKED = "online_blocked"
+    private const val KEY_TASTE = "online_taste"
+    private const val KEY_DEAD = "online_dead"
+    private const val KEY_LOG = "online_log"
+    private const val KEY_SEEN = "online_seen"
+
+    /**
+     * First run on this install: start from a clean slate so no stale marker from an earlier build can
+     * misfire (a phantom "alive" flag, a half-saved last video). Existing users are left untouched.
+     */
+    fun onboard(context: Context) {
+        val p = prefs(context)
+        if (p.getBoolean(KEY_SEEN, false)) return
+        val existing = history(context).isNotEmpty()
+        val edit = p.edit().putBoolean(KEY_SEEN, true)
+        if (!existing) edit.remove(KEY_BLOCKED).remove(KEY_LAST).remove(KEY_POSITION).putBoolean(KEY_ALIVE, false)
+        edit.apply()
+    }
+
+    // ---- What the person listens to ------------------------------------------------------------------------------
+
+    fun taste(context: Context): Map<String, Int> {
+        val raw = prefs(context).getString(KEY_TASTE, null) ?: return emptyMap()
+        return runCatching {
+            val obj = JSONObject(raw)
+            val map = LinkedHashMap<String, Int>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                map[key] = obj.optInt(key)
+            }
+            map
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun bumpTaste(context: Context, channel: String, delta: Int) {
+        if (channel.isBlank()) return
+        val map = taste(context).toMutableMap()
+        map[channel] = ((map[channel] ?: 0) + delta).coerceAtLeast(0)
+        val obj = JSONObject()
+        map.entries.sortedByDescending { it.value }.take(40).forEach { obj.put(it.key, it.value) }
+        prefs(context).edit().putString(KEY_TASTE, obj.toString()).apply()
+    }
+
+    fun recordPlay(context: Context, video: OnlineVideo) = bumpTaste(context, video.channel, 1)
+    fun recordFinished(context: Context, video: OnlineVideo) = bumpTaste(context, video.channel, 2)
+    fun recordSkip(context: Context, video: OnlineVideo) = bumpTaste(context, video.channel, -1)
+
+    fun favoriteChannels(context: Context, limit: Int): List<String> =
+        taste(context).entries.filter { it.value > 0 }.sortedByDescending { it.value }.take(limit).map { it.key }
+
+    /** Videos that could not be played even after every repair step; autoplay never picks them again. */
+    fun dead(context: Context): Set<String> =
+        prefs(context).getStringSet(KEY_DEAD, emptySet())?.toSet() ?: emptySet()
+
+    fun addDead(context: Context, id: String) {
+        prefs(context).edit().putStringSet(KEY_DEAD, dead(context) + id).apply()
+    }
+
+    /** Small ring buffer of what the watchdog saw and fixed. Never shown; kept for diagnosis. */
+    fun log(context: Context, line: String) {
+        val lines = (prefs(context).getString(KEY_LOG, "").orEmpty().split("\n").filter { it.isNotBlank() } +
+            "${System.currentTimeMillis()} $line").takeLast(40)
+        prefs(context).edit().putString(KEY_LOG, lines.joinToString("\n")).apply()
+    }
 
     /** IDs that refuse to play in the embedded player, remembered so a restart goes straight to the watch page. */
     fun blocked(context: Context): Set<String> =
@@ -172,6 +246,31 @@ function load(id, start) {
 function playVideo2() { if (player) { player.playVideo(); forceSound(); } }
 function pauseVideo2() { if (player) player.pauseVideo(); }
 function seek(s) { if (player) player.seekTo(s, true); }
+function frameDoc() { try { var f = document.querySelector('iframe'); return f ? (f.contentDocument || null) : null; } catch (e) { return null; } }
+var adWasShowing = false;
+// The embed iframe has the same origin as this page, so its ad state can be read and skipped directly:
+// click Skip when offered, otherwise fast-forward the ad to its end while muted. No tap is needed.
+function killAds() {
+  var d = frameDoc();
+  if (!d) { return; }
+  var showing = !!d.querySelector('.ad-showing, .ad-interrupting');
+  if (showing) {
+    adWasShowing = true;
+    try {
+      var v = d.querySelector('video');
+      if (v) { v.muted = true; v.playbackRate = 16; if (isFinite(v.duration) && v.duration > 0) { v.currentTime = v.duration; } }
+      var b = d.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-container button');
+      if (b) { b.click(); }
+      var c = d.querySelector('.ytp-ad-overlay-close-button');
+      if (c) { c.click(); }
+    } catch (e) {}
+  } else if (adWasShowing) {
+    adWasShowing = false;
+    try { var v2 = d.querySelector('video'); if (v2) { v2.playbackRate = 1; v2.muted = false; } } catch (e) {}
+    forceSound();
+  }
+}
+setInterval(killAds, 250);
 setInterval(function () {
   if (player && player.getCurrentTime && player.getDuration) {
     // Only report the video the app actually asked for. While a new video is still loading the
@@ -228,8 +327,11 @@ private const val WATCH_JS = """
     return null;
   }
   function skipAd() {
-    // Click "Skip" if an ad grows one; harmless otherwise.
+    // Fast-forward the ad to its end (muted) and click "Skip" whenever one is offered. No tap is needed.
     try {
+      window.__adWas = true;
+      var av = document.querySelector('video');
+      if (av) { av.muted = true; av.playbackRate = 16; if (isFinite(av.duration) && av.duration > 0) { av.currentTime = av.duration; } }
       var b = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
       if (b) { b.click(); }
       // Ads on the mobile page sometimes sit in an overlay the page itself opens; close it.
@@ -253,6 +355,11 @@ private const val WATCH_JS = """
     hook();
     forceSound();
     if (adShowing()) { skipAd(); }
+    else if (window.__adWas) {
+      window.__adWas = false;
+      var rv = document.querySelector('video');
+      if (rv) { rv.playbackRate = 1; rv.muted = false; }
+    }
     var v = document.querySelector('video');
     if (v && v.duration > 0 && isFinite(v.duration) && !adShowing()) {
       var id = pageVideoId();
@@ -262,7 +369,7 @@ private const val WATCH_JS = """
       Android.pageVideo(id || '');
       Android.time(v.currentTime, v.duration);
     }
-  }, 1000);
+  }, 400);
 })();
 """
 
@@ -331,7 +438,11 @@ object OnlinePlayer {
     }
 
     fun init(context: Context) {
-        if (appContext == null) appContext = context.applicationContext
+        if (appContext == null) {
+            appContext = context.applicationContext
+            OnlineStore.onboard(context.applicationContext)
+        }
+        startWatchdog()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -358,6 +469,8 @@ object OnlinePlayer {
 
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 val host = request.url.host ?: return BLOCKED_RESPONSE
+                val whole = request.url.toString()
+                if (whole.contains("/pagead/") || whole.contains("/api/stats/ads") || whole.contains("get_midroll")) return BLOCKED_RESPONSE
                 return if (isAllowedHost(host)) null else BLOCKED_RESPONSE
             }
 
@@ -552,13 +665,19 @@ object OnlinePlayer {
         main.post { web?.evaluateJavascript(script, null) }
     }
 
+    private var userInitiated = true
+    private var healStage = 0
+    private var autoplayBusy = false
+    private var endedGeneration = -1L
+    private var pageMismatch = 0
+    private var frozenHits = 0
+
     fun play(video: OnlineVideo, list: List<OnlineVideo>) {
-        queue = list
-        index = list.indexOfFirst { it.id == video.id }
-        if (index < 0) {
-            queue = listOf(video)
-            index = 0
-        }
+        // Only the chosen song is queued. What plays after it is picked from similar music, never from the
+        // list it was tapped in (Continue playing, results, ...), which used to jump to unrelated songs.
+        queue = listOf(video)
+        index = 0
+        userInitiated = true
         startVideo(video, 0.0, true)
     }
 
@@ -572,20 +691,27 @@ object OnlinePlayer {
         return true
     }
 
-    private fun startVideo(video: OnlineVideo, startSec: Double, startService: Boolean) {
+    private fun startVideo(video: OnlineVideo, startSec: Double, startService: Boolean, heal: Boolean = false) {
         if (!Regex("[A-Za-z0-9_-]{6,20}").matches(video.id)) return
         val context = appContext ?: return
         // Any event still on its way from the previous video is now obsolete.
         generation += 1
         val gen = generation
-        failStreak = 0
+        pageMismatch = 0
+        frozenHits = 0
+        if (!heal) {
+            failStreak = 0
+            healStage = 0
+            OnlineStore.recordPlay(context, video)
+            OnlineStore.addHistory(context, video)
+            OnlineStore.log(context, "play ${video.id}")
+        }
         // Claim the single media notification before anything starts.
         com.musicrage.app.playback.PlaybackSupervisor.claim(context, com.musicrage.app.playback.PlaybackSupervisor.Owner.ONLINE)
-        state = OnlineState(video, isPlaying = true, hasPrev = index > 0, hasNext = index < queue.size - 1)
+        state = OnlineState(video, isPlaying = true, hasPrev = index > 0, hasNext = true)
         positionSec = startSec
         durationSec = 0.0
         OnlineLoading.active = true
-        OnlineStore.addHistory(context, video)
         OnlineStore.saveLast(context, video, startSec)
         OnlineStore.setAlive(context, true)
         if (startService) {
@@ -596,7 +722,6 @@ object OnlinePlayer {
         pendingLoad = null
         if (OnlineStore.blocked(context).contains(video.id)) {
             main.post { loadWatchPage(video.id, startSec) }
-            armWatchTimeout(gen)
         } else {
             if (watchMode) main.post { loadEmbedPage(view) }
             if (pageReady && !watchMode) {
@@ -605,25 +730,59 @@ object OnlinePlayer {
                 pendingLoad = video.id to startSec
             }
         }
+        armWatchTimeout(gen)
         listener?.invoke()
     }
 
-    /** If even the watch page never starts, give up on this video and move on. */
-    private fun armWatchTimeout(gen: Long = 0L) {
+    /** If the song still has not started after a while, repair it quietly. */
+    private fun armWatchTimeout(gen: Long) {
         val token = watchToken
         main.postDelayed({
-            if (token == watchToken && gen == generation && OnlineLoading.active) {
-                val context = appContext
-                if (context != null && state.video != null) {
-                    com.musicrage.app.Toaster.show(context, "This video can't be played")
-                }
-                if (index + 1 < queue.size) next() else {
-                    OnlineLoading.active = false
-                    state = state.copy(isPlaying = false)
-                    listener?.invoke()
-                }
-            }
+            if (token == watchToken && gen == generation && OnlineLoading.active) healFailure(gen)
         }, 25_000L)
+    }
+
+    /**
+     * Silent repair ladder, nothing is shown to the person: 1) reload the song in the same player,
+     * 2) switch to the other player type, 3) give up on that video and move on.
+     */
+    private fun healFailure(gen: Long) {
+        if (gen != generation) return
+        val video = state.video ?: return
+        val context = appContext ?: return
+        healStage += 1
+        OnlineStore.log(context, "heal $healStage ${video.id}")
+        when (healStage) {
+            1 -> {
+                if (!watchMode) web?.let { loadEmbedPage(it) }
+                startVideo(video, positionSec, false, heal = true)
+            }
+            2 -> {
+                OnlineStore.addBlocked(context, video.id)
+                startVideo(video, positionSec, false, heal = true)
+            }
+            else -> giveUp(video)
+        }
+    }
+
+    private fun giveUp(video: OnlineVideo) {
+        val context = appContext ?: return
+        OnlineStore.addDead(context, video.id)
+        OnlineStore.log(context, "dead ${video.id}")
+        OnlineLoading.active = false
+        healStage = 0
+        if (!userInitiated || index + 1 < queue.size) {
+            // The song came from autoplay (or has a successor): quietly pick another one.
+            if (index + 1 < queue.size) {
+                index += 1
+                startVideo(queue[index], 0.0, false)
+            } else {
+                autoplaySimilar(context)
+            }
+        } else {
+            state = state.copy(isPlaying = false)
+            listener?.invoke()
+        }
     }
 
     private fun jsPlay() = runJs(if (watchMode) "window.mrPlay && mrPlay()" else "playVideo2()")
@@ -649,9 +808,14 @@ object OnlinePlayer {
     }
 
     fun next() {
+        val context = appContext
+        val video = state.video
+        if (context != null && video != null && positionSec < 20.0) OnlineStore.recordSkip(context, video)
         if (index + 1 < queue.size) {
             index += 1
             startVideo(queue[index], 0.0, false)
+        } else {
+            autoplaySimilar(context)
         }
     }
 
@@ -699,36 +863,80 @@ object OnlinePlayer {
                     state = state.copy(isPlaying = false)
                     context?.let { OnlineStore.setAlive(it, false) }
                 }
-                0 -> {
-                    // Track finished: continue with the queue, or find something similar on YouTube.
-                    if (index + 1 < queue.size) {
-                        next()
-                    } else {
-                        state = state.copy(isPlaying = false)
-                        context?.let { OnlineStore.setAlive(it, false) }
-                        autoplaySimilar(context)
-                    }
-                }
+                0 -> onTrackEnded(context)
             }
             listener?.invoke()
         }
     }
 
-    /** After the last queue item ends, quietly loads a related song so playback never just stops. */
+    private fun onTrackEnded(context: Context?) {
+        if (endedGeneration == generation) return
+        endedGeneration = generation
+        state = state.copy(isPlaying = false)
+        val video = state.video
+        if (context != null && video != null) {
+            OnlineStore.setAlive(context, false)
+            OnlineStore.recordFinished(context, video)
+        }
+        if (index + 1 < queue.size) {
+            index += 1
+            startVideo(queue[index], 0.0, false)
+        } else {
+            autoplaySimilar(context)
+        }
+    }
+
+    /** Titles that are long mixes, charts or streams rather than a single song. */
+    private fun looksLikeSong(video: OnlineVideo): Boolean {
+        val title = video.title.lowercase()
+        val noise = listOf("hours", "hour mix", "top 100", "top 50", "top 20", "top 10", "playlist", " mix", "compilation",
+            "nonstop", "non-stop", "non stop", "full album", "best of", "jukebox", "24/7", "live stream", "hits 20", "trending")
+        return title.length < 140 && noise.none { title.contains(it) }
+    }
+
+    /**
+     * After a song ends (or Next is pressed with nothing queued) a similar song is chosen: first the same artist, then
+     * songs like this one, then the artists the person plays most. Songs already played, blocked or dead are skipped.
+     */
     private fun autoplaySimilar(context: Context?) {
         val finished = state.video ?: return
-        if (context == null) return
+        if (context == null || autoplayBusy) return
+        autoplayBusy = true
+        val gen = generation
+        val seen = OnlineStore.history(context).map { it.id }.toSet() + queue.map { it.id }
+        val avoid = OnlineStore.blocked(context) + OnlineStore.dead(context)
+        val artist = finished.channel.replace(Regex("(?i)\\s*-\\s*topic$|vevo$"), "").trim()
         val seed = finished.title.substringBefore(" (").substringBefore(" [").substringBefore("Official").trim()
-        val query = if (finished.channel.isNotBlank()) "${finished.channel} music" else seed.ifEmpty { return }
-        val blocked = OnlineStore.blocked(context)
+        val queries = buildList<String> {
+            if (artist.isNotBlank()) add("$artist songs")
+            if (seed.isNotBlank()) add("songs similar to $seed")
+            OnlineStore.favoriteChannels(context, 3).filter { !it.equals(artist, ignoreCase = true) }.forEach { add("$it songs") }
+            add("popular songs")
+        }.distinct()
+        OnlineLoading.active = true
         Thread {
-            val found = runCatching { com.musicrage.app.data.OnlineApi.search(query) }.getOrDefault(emptyList())
-            val pick = found.firstOrNull { it.id != finished.id && !blocked.contains(it.id) }
+            var pick: OnlineVideo? = null
+            for (query in queries) {
+                val found = runCatching { com.musicrage.app.data.OnlineApi.search(query) }.getOrDefault(emptyList())
+                val candidates = found.filter { it.id !in seen && it.id !in avoid && looksLikeSong(it) }
+                if (candidates.isNotEmpty()) {
+                    pick = candidates.take(5).random()
+                    break
+                }
+            }
+            val chosen = pick
             main.post {
-                if (pick != null && state.video?.id == finished.id && !state.isPlaying) {
-                    queue = listOf(finished, pick)
-                    index = 1
-                    startVideo(pick, 0.0, false)
+                autoplayBusy = false
+                if (gen != generation) return@post
+                if (chosen == null) {
+                    OnlineLoading.active = false
+                    state = state.copy(isPlaying = false)
+                    listener?.invoke()
+                } else {
+                    userInitiated = false
+                    queue = queue + chosen
+                    index = queue.size - 1
+                    startVideo(chosen, 0.0, false)
                 }
             }
         }.start()
@@ -760,42 +968,25 @@ object OnlinePlayer {
     }
 
     /**
-     * The watch page reports which video it is really on. YouTube auto-advances to a related video when
-     * one ends (and ads can force their own navigation), so the card, mini bar and notification used to
-     * keep showing the OLD title while something else played. Follow the page instead.
+     * The watch page reports which video it is really on. If it moved to a video the app did not ask for (YouTube's
+     * own autoplay, or an ad forcing navigation), the requested song counts as finished and the app chooses what
+     * plays next instead of showing a made-up "Playing next" entry.
      */
     internal fun handlePageVideo(id: String) {
         val gen = generation
         main.post {
-            if (gen != generation || id.isBlank() || watchMode) return@post
+            if (gen != generation || id.isBlank()) return@post
             val current = state.video ?: return@post
-            if (id == current.id) return@post
-            // The page moved on. Update the shown video so the UI and notification follow it.
-            val nextVideo = OnlineVideo(id, "Playing next", "Online", current.thumb)
-            state = state.copy(video = nextVideo)
-            queue = listOf(nextVideo)
-            index = 0
-            positionSec = 0.0
-            durationSec = 0.0
-            OnlineLoading.active = true
-            val context = appContext
-            if (context != null) {
-                OnlineStore.addHistory(context, nextVideo)
-                OnlineStore.saveLast(context, nextVideo, 0.0)
-                // Fill in the real title in the background so the card does not stay generic.
-                Thread {
-                    val found = runCatching { com.musicrage.app.data.OnlineApi.search(id) }.getOrDefault(emptyList())
-                    val match = found.firstOrNull { it.id == id }
-                    if (match != null) main.post {
-                        if (state.video?.id == id) {
-                            state = state.copy(video = match)
-                            OnlineStore.saveLast(context, match, 0.0)
-                            listener?.invoke()
-                        }
-                    }
-                }.start()
+            if (id == current.id) {
+                pageMismatch = 0
+                return@post
             }
-            listener?.invoke()
+            pageMismatch += 1
+            if (pageMismatch >= 2) {
+                pageMismatch = 0
+                jsPause()
+                onTrackEnded(appContext)
+            }
         }
     }
 
@@ -803,42 +994,83 @@ object OnlinePlayer {
         val gen = generation
         main.post {
             if (gen != generation) return@post
-            val video = state.video
-            val context = appContext
-            // No online song is loading (fresh start, or the local player just took over): an error from the
-            // idle page is not worth a toast.
-            if (video == null) return@post
+            val video = state.video ?: return@post
+            val context = appContext ?: return@post
             // The song is already audible; a stray error from an old page must not interrupt it.
             if (!OnlineLoading.active && state.isPlaying && positionSec > 1.0) return@post
-            // Embedding is blocked or misconfigured for this video: play it from the normal watch page instead.
-            if (!watchMode && video != null && context != null && !OnlineStore.blocked(context).contains(video.id)) {
+            OnlineStore.log(context, "error $code ${video.id}")
+            // Embedding blocked for this video: use the normal watch page from now on.
+            if (!watchMode && !OnlineStore.blocked(context).contains(video.id)) {
                 OnlineStore.addBlocked(context, video.id)
-                watchToken += 1
-                loadWatchPage(video.id, 0.0)
-                armWatchTimeout(gen)
+                startVideo(video, positionSec, false, heal = true)
                 return@post
             }
-            // The watch page itself failed: fall back to the embed player for the next attempt.
-            if (watchMode && video != null) {
-                watchToken += 1
-                loadEmbedPage(web ?: return@post)
-                pendingLoad = video.id to positionSec
+            healFailure(gen)
+        }
+    }
+
+    // ---- Watchdog -------------------------------------------------------------------------------------------------
+
+    private var watchdogStarted = false
+    private var loadingSince = 0L
+    private var lastPos = 0.0
+    private var lastPosAt = 0L
+
+    /**
+     * Watches the online player on its own and repairs problems without telling anyone: a page that never loads,
+     * a song stuck on "loading", or a song that is "playing" but whose clock stopped.
+     */
+    private fun startWatchdog() {
+        if (watchdogStarted) return
+        watchdogStarted = true
+        main.postDelayed(object : Runnable {
+            override fun run() {
+                runCatching { watchdogTick() }
+                main.postDelayed(this, 2_000L)
             }
-            // Several attempts failed in a row: stop trying instead of looping through the same
-            // failure (the "can't be played" toast spam).
-            failStreak += 1
-            if (failStreak >= 3) {
-                failStreak = 0
-                OnlineLoading.active = false
-                if (context != null) com.musicrage.app.Toaster.show(context, "This video can't be played")
-                stop(clearView = false)
-                return@post
+        }, 2_000L)
+    }
+
+    private fun watchdogTick() {
+        val now = android.os.SystemClock.uptimeMillis()
+        val video = state.video
+        if (video == null || autoplayBusy) {
+            loadingSince = 0L
+            lastPosAt = now
+            return
+        }
+        if (OnlineLoading.active) {
+            if (loadingSince == 0L) loadingSince = now
+            if (now - loadingSince > 14_000L) {
+                loadingSince = now
+                healFailure(generation)
             }
-            if (context != null) com.musicrage.app.Toaster.show(context, "This video can't be played")
-            if (index + 1 < queue.size) next() else {
-                OnlineLoading.active = false
-                state = state.copy(isPlaying = false)
-                listener?.invoke()
+            lastPos = positionSec
+            lastPosAt = now
+            return
+        }
+        loadingSince = 0L
+        if (!state.isPlaying || (durationSec > 0.0 && positionSec >= durationSec - 1.5)) {
+            lastPos = positionSec
+            lastPosAt = now
+            frozenHits = 0
+            return
+        }
+        if (kotlin.math.abs(positionSec - lastPos) > 0.2) {
+            lastPos = positionSec
+            lastPosAt = now
+            frozenHits = 0
+            return
+        }
+        if (now - lastPosAt > 9_000L) {
+            lastPosAt = now
+            frozenHits += 1
+            appContext?.let { OnlineStore.log(it, "frozen ${video.id} hit $frozenHits") }
+            if (frozenHits == 1) {
+                jsPlay()
+            } else {
+                frozenHits = 0
+                healFailure(generation)
             }
         }
     }

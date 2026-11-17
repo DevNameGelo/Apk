@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.16
+- The "This video can't be played" toast is gone for good. Failures are repaired silently instead: reload the song, switch player type, then move on to another song.
+- Auto-next now plays a similar song instead of the next item of the list you tapped in. After a song ends (or Next is pressed with nothing queued) the app picks one from the same artist, songs like it, or the artists you play most, skipping songs you already played, long mixes and charts, and videos that cannot play.
+- The made-up "Playing next" entry and its duplicate in Continue playing are gone. If YouTube's own autoplay jumps to another video, the app treats the song as finished and chooses what plays next. Old placeholder entries are cleaned automatically.
+- Continue playing cards have an X to remove them; a song returns when you play it again.
+- Ads: the hidden player now skips ads by itself. It clicks Skip when offered, otherwise fast-forwards the ad to its end while muted, on both the embedded player and the watch-page fallback. Known ad requests are blocked as well. No tap needed.
+- Silent self-healing watchdog: it notices a first-time install, what plays, what gets skipped or finished (used to learn your taste), and repairs a page that never loads, a song stuck on loading, or a song whose clock froze. It never shows a message; a small private log is kept for diagnosis.
+
 ## 1.2.10
 - Fixed the Online spinner that kept spinning while the song was already playing: loading now ends as soon as the playback clock advances, not only when the page happens to send its "playing" event. The 25-second give-up timer also follows the real loading state now.
 - Fixed the false "This video can't be played" toast right after opening the app and when switching to a local song while online music was playing. Errors from the idle player page are ignored unless an online song is actually loading, and a song that is already audible is never interrupted by a stray error.

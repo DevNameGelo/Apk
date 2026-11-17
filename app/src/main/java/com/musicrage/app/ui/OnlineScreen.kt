@@ -36,6 +36,7 @@ import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -170,7 +171,8 @@ fun OnlineScreen(activity: MainActivity) {
     var error by remember { mutableStateOf<String?>(null) }
     val state = OnlinePlayer.state
     val current = state.video
-    val history = remember(current?.id) { OnlineStore.history(activity) }
+    var historyTick by remember { mutableIntStateOf(0) }
+    val history = remember(current?.id, historyTick) { OnlineStore.history(activity) }
 
     fun loadRecommended() {
         scope.launch {
@@ -313,7 +315,14 @@ fun OnlineScreen(activity: MainActivity) {
                 item(key = "history-row") {
                     LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         items(history, key = { "h-" + it.id }) { video ->
-                            OnlineShelfCard(video, current?.id == video.id) { OnlinePlayer.play(video, history) }
+                            OnlineShelfCard(
+                                video = video,
+                                isCurrent = current?.id == video.id,
+                                onRemove = {
+                                    OnlineStore.removeHistory(activity, video.id)
+                                    historyTick += 1
+                                }
+                            ) { OnlinePlayer.play(video, history) }
                         }
                     }
                 }
@@ -454,9 +463,17 @@ private fun OnlineSectionTitle(text: String) {
 }
 
 @Composable
-private fun OnlineShelfCard(video: OnlineVideo, isCurrent: Boolean, onClick: () -> Unit) {
+private fun OnlineShelfCard(video: OnlineVideo, isCurrent: Boolean, onRemove: () -> Unit, onClick: () -> Unit) {
     Column(Modifier.width(156.dp).clickable(onClick = onClick)) {
-        NetImage(video.thumb, Modifier.width(156.dp).height(88.dp), RoundedCornerShape(14.dp))
+        Box {
+            NetImage(video.thumb, Modifier.width(156.dp).height(88.dp), RoundedCornerShape(14.dp))
+            // Remove from "Continue playing". The song comes back the next time it is played.
+            Box(
+                Modifier.align(Alignment.TopEnd).padding(6.dp).size(26.dp).clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.65f)).clickable(onClick = onRemove),
+                contentAlignment = Alignment.Center
+            ) { RIcon(R.drawable.ic_x, tint = Color.White, size = 14.dp, contentDescription = "Remove") }
+        }
         Spacer(Modifier.height(8.dp))
         Text(
             video.title,
