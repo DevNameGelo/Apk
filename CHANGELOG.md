@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.2.19
+- Fixed the crash when opening the Online tab (or right after start-up): entries saved by earlier versions had no stored length, and reading one back produced a corrupted number that Android's JSON writer refuses to save — the crash fired the moment the app rewrote history or the resume pointer. Unknown lengths now read as 0 and are saved as 0 instead of the value that crashed.
+
 ## 1.2.18
 - Fixed songs that showed 0 duration and never played: SoundCloud delivers its audio from a CDN host (playback.media-streaming.soundcloud.cloud) the player sandbox was refusing. The sandbox now allows SoundCloud's media delivery hosts, so streams actually reach the widget.
 - Fixed songs that stopped after ~30 seconds while the card still said "playing": the pause marker written by a stray widget event disabled crash recovery and could also make the watchdog treat a healthy song as frozen. Pauses no longer clear the recovery marker.

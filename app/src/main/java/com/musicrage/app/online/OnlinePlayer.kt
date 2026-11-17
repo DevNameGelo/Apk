@@ -76,7 +76,11 @@ object OnlineStore {
 
     private fun toJson(video: OnlineVideo) = JSONObject()
         .put("id", video.id).put("title", video.title).put("channel", video.channel).put("thumb", video.thumb)
-        .put("permalink", video.permalink).put("duration", video.duration).put("playable", video.playable)
+        .put("permalink", video.permalink)
+        // A NaN here throws JSONException ("Forbidden numeric value") on save and crashed the app on
+        // the Online tab when an entry from an older build was rewritten, so it is never stored.
+        .put("duration", if (video.duration.isNaN() || video.duration < 0) 0.0 else video.duration)
+        .put("playable", video.playable)
 
     private fun fromJson(obj: JSONObject) = OnlineVideo(
         obj.optString("id"),
@@ -84,7 +88,9 @@ object OnlineStore {
         obj.optString("channel"),
         obj.optString("thumb"),
         obj.optString("permalink"),
-        obj.optDouble("duration"),
+        // Entries saved by 1.2.17 have no "duration"; the no-fallback optDouble would hand back NaN
+        // and blow up the very next save. Anything unreadable counts as "unknown" (0), not NaN.
+        obj.optDouble("duration", 0.0).takeUnless { it.isNaN() } ?: 0.0,
         obj.optBoolean("playable", true)
     )
 
