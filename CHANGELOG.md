@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.17
+- SoundCloud everywhere instead of YouTube: search, playback and cover art all come from SoundCloud now. The old YouTube player (embed, watch-page fallback, ad skipping, embed-block list) is gone — no more "This video can't be played", no ads, no embed-blocked songs. The player is the official SoundCloud widget, which plays every public track.
+- Downloads straight from SoundCloud: the song's stream is fetched segment by segment from SoundCloud's CDN and saved as a single file (m4a) in Music/Music Rage, with the real title, artist and duration in the library. The old MP3 converter stays as a fallback for restricted songs (it accepts SoundCloud links too), so the download button keeps working the same way.
+- Auto-recovery after the app is killed: the watchdog alarm now fires sooner (45 s instead of 60 s), recovery no longer cancels itself mid-repair, a killed-while-playing state is detected by the heartbeat's age (so reopening the app always resumes), and the song resumes at the exact position where it stopped. The widget also nudges itself back to play if its own audio-focus dance pauses it.
+- The client id SoundCloud requires is resolved automatically: a known id is used first and a fresh one is scraped from the widget bundle whenever it stops working, so search and playback keep going after SoundCloud rotates ids.
+
 ## 1.2.16
 - The "This video can't be played" toast is gone for good. Failures are repaired silently instead: reload the song, switch player type, then move on to another song.
 - Auto-next now plays a similar song instead of the next item of the list you tapped in. After a song ends (or Next is pressed with nothing queued) the app picks one from the same artist, songs like it, or the artists you play most, skipping songs you already played, long mixes and charts, and videos that cannot play.

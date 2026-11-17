@@ -55,11 +55,9 @@ class OnlineService : Service() {
     private val recoveryTimeout = Runnable {
         if (recovering) {
             recovering = false
-            if (!OnlinePlayer.state.isPlaying) {
-                // A failed recovery is quiet: the Online tab already shows the "continue playing" entry,
-                // and a toast here would fight with the local player's own recovery messages.
-                OnlinePlayer.stop()
-            }
+            // No stop() here: the player's own silent watchdog keeps repairing (reload, reload page,
+            // move on) for far longer than this timeout. Stopping here used to cancel a recovery that
+            // was still about to succeed, leaving the music silent for good.
             refresh()
         }
     }
@@ -83,7 +81,8 @@ class OnlineService : Service() {
         handler.postDelayed(heartbeat, 2_000L)
 
         // A previous instance that was playing and never reached onDestroy means the process was killed.
-        val killed = OnlineStore.isAlive(this)
+        // The song resumes exactly where it stopped (the player saves the position every few seconds).
+        val killed = OnlineStore.isAlive(this) && OnlineStore.beatAgeMs(this) >= 8_000L
         if (killed && MusicPreferences.autoRecover(this) && OnlinePlayer.state.video == null) beginRecovery()
     }
 
@@ -232,7 +231,9 @@ class OnlineService : Service() {
     private fun armWatchdog() {
         runCatching {
             val alarms = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val triggerAt = System.currentTimeMillis() + 60_000L
+            // The alarm fires only when the process dies (the heartbeat keeps pushing it back while alive),
+            // so a tighter window means a killed app recovers sooner.
+            val triggerAt = System.currentTimeMillis() + 45_000L
             if (Build.VERSION.SDK_INT < 31 || alarms.canScheduleExactAlarms()) {
                 alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, watchdogIntent())
             } else {

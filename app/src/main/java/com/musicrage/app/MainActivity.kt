@@ -26,6 +26,8 @@ import com.musicrage.app.data.AudioTrack
 import com.musicrage.app.data.MusicPreferences
 import com.musicrage.app.data.cleanTitle
 import com.musicrage.app.online.OnlinePlayer
+import com.musicrage.app.online.OnlineService
+import com.musicrage.app.online.OnlineStore
 import com.musicrage.app.playback.AppVisibility
 import com.musicrage.app.playback.PlaybackService
 import com.musicrage.app.playback.PlayerConnection
@@ -81,6 +83,13 @@ class MainActivity : ComponentActivity() {
         pendingExternalUri?.let {
             pendingExternalUri = null
             openExternalAudio(it)
+        }
+        // The app was killed while an online song was playing (its service never got to clean up):
+        // start the service so it recovers the song at the exact position where it stopped.
+        if (OnlineStore.isAlive(this) && OnlineStore.beatAgeMs(this) >= 8_000L) {
+            runCatching {
+                startForegroundService(Intent(this, OnlineService::class.java).setAction(OnlineService.ACTION_RECOVER))
+            }
         }
     }
 

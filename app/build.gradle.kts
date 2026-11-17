@@ -16,8 +16,8 @@ android {
         applicationId = "com.musicrage.app"
         minSdk = 29
         targetSdk = 36
-        versionCode = 21
-        versionName = "1.2.16"
+        versionCode = 22
+        versionName = "1.2.17"
     }
 
     signingConfigs {

@@ -35,6 +35,12 @@ class RecoveryReceiver : BroadcastReceiver() {
             if (runCatching { context.startForegroundService(start) }.isFailure) failed = true
         }
         if (needed && failed) showTapToResume(context)
+
+        // A started recovery service takes over the watchdog from here; nothing else to schedule.
+        if (!needed) {
+            // Nobody was playing: the alarm may still fire again later without a service running,
+            // which is harmless (the checks above simply pass).
+        }
     }
 
     private fun showTapToResume(context: Context) {
