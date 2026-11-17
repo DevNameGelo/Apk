@@ -508,9 +508,16 @@ object OnlinePlayer {
         releaseOverlay()
         (view.parent as? ViewGroup)?.removeView(view)
         lastPlaced = null
-        view.alpha = 0.02f
+        // Fully invisible: alpha 0 and parked off-screen (negative margins). The widget keeps
+        // playing from an off-screen window; a 0.02 alpha used to leave a faint grey square
+        // visible whenever the app drew a black screen behind it.
+        view.alpha = 0f
         view.passThrough = true
-        activity.addContentView(view, FrameLayout.LayoutParams(PARK_W, PARK_H).apply { gravity = Gravity.TOP or Gravity.START })
+        activity.addContentView(view, FrameLayout.LayoutParams(PARK_W, PARK_H).apply {
+            gravity = Gravity.TOP or Gravity.START
+            leftMargin = -PARK_W * 2
+            topMargin = -PARK_H * 2
+        })
     }
 
     /** Called when the Activity goes away. If music is playing, the player view moves to a tiny overlay window. */
@@ -585,8 +592,10 @@ object OnlinePlayer {
                 PixelFormat.TRANSLUCENT
             )
             params.gravity = Gravity.TOP or Gravity.START
+            params.x = -PARK_W * 2
+            params.y = -PARK_H * 2
             view.passThrough = true
-            view.alpha = 0.02f
+            view.alpha = 0f
             (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).addView(view, params)
             overlayHosted = true
             inOverlay = true
@@ -605,10 +614,10 @@ object OnlinePlayer {
         // Keep a real player size while parked (a 1px player gets paused by the page); it is invisible and touch-proof.
         params.width = PARK_W
         params.height = PARK_H
-        params.leftMargin = 0
-        params.topMargin = 0
+        params.leftMargin = -PARK_W * 2
+        params.topMargin = -PARK_H * 2
         view.passThrough = true
-        view.alpha = 0.02f
+        view.alpha = 0f
         view.layoutParams = params
         lastPlaced = wanted
     }
@@ -843,8 +852,12 @@ object OnlinePlayer {
     }
 
     /**
-     * After a song ends (or Next is pressed with nothing queued) a similar song is chosen: first the same artist, then
-     * songs like this one, then the artists the person plays most. Songs already played, blocked or dead are skipped.
+     * After a song ends (or Next is pressed with nothing queued) a similar song is chosen, so the
+     * Online tab NEVER hands playback back to the local library. SoundCloud's own "related tracks"
+     * list for the song that just finished comes first (that is what the site's station uses);
+     * only when that comes up empty does the old ladder run — the same artist, songs like this one,
+     * the artists the person plays most, then popular songs. Songs already played, blocked or dead
+     * are skipped.
      */
     private fun autoplaySimilar(context: Context?) {
         val finished = state.video ?: return
@@ -855,21 +868,26 @@ object OnlinePlayer {
         val avoid = OnlineStore.dead(context)
         val artist = finished.channel.trim()
         val seed = finished.title.substringBefore(" (").substringBefore(" [").trim()
-        val queries = buildList<String> {
-            if (artist.isNotBlank()) add(artist)
-            if (seed.isNotBlank()) add(seed)
-            OnlineStore.favoriteChannels(context, 3).filter { !it.equals(artist, ignoreCase = true) }.forEach { add(it) }
-            add("popular songs")
-        }.distinct()
         OnlineLoading.active = true
         Thread {
-            var pick: OnlineVideo? = null
-            for (query in queries) {
-                val found = runCatching { com.musicrage.app.data.OnlineApi.search(query) }.getOrDefault(emptyList())
-                val candidates = found.filter { it.id !in seen && it.id !in avoid && looksLikeSong(it) }
-                if (candidates.isNotEmpty()) {
-                    pick = candidates.take(5).random()
-                    break
+            // 1) SoundCloud's own related tracks for the song that just ended.
+            val related = runCatching { com.musicrage.app.data.OnlineApi.related(finished.id) }.getOrDefault(emptyList())
+            var pick = related.filter { it.id !in seen && it.id !in avoid && looksLikeSong(it) }.randomOrNull()
+            // 2) The old ladder, only when related came up empty: same artist, this song, favourites, popular.
+            if (pick == null) {
+                val queries = buildList<String> {
+                    if (artist.isNotBlank()) add(artist)
+                    if (seed.isNotBlank()) add(seed)
+                    OnlineStore.favoriteChannels(context, 3).filter { !it.equals(artist, ignoreCase = true) }.forEach { add(it) }
+                    add("popular songs")
+                }.distinct()
+                for (query in queries) {
+                    val found = runCatching { com.musicrage.app.data.OnlineApi.search(query) }.getOrDefault(emptyList())
+                    val candidates = found.filter { it.id !in seen && it.id !in avoid && looksLikeSong(it) }
+                    if (candidates.isNotEmpty()) {
+                        pick = candidates.take(5).random()
+                        break
+                    }
                 }
             }
             val chosen = pick

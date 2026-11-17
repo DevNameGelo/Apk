@@ -173,19 +173,9 @@ fun OnlineScreen(activity: MainActivity) {
     val current = state.video
     var historyTick by remember { mutableIntStateOf(0) }
     val history = remember(current?.id, historyTick) { OnlineStore.history(activity) }
-
-    fun loadRecommended() {
-        scope.launch {
-            loadingRecommended = true
-            try {
-                recommended = withContext(Dispatchers.IO) { OnlineApi.recommended() }
-                error = null
-            } catch (e: Exception) {
-                error = e.message ?: "Could not load recommendations"
-            }
-            loadingRecommended = false
-        }
-    }
+    // Search suggestions while typing (SoundCloud autocomplete: "kalapa" offers "kalapastanganan").
+    var suggestions by remember { mutableStateOf<List<String>>(emptyList()) }
+    var suggestionTick by remember { mutableIntStateOf(0) }
 
     fun search() {
         val text = query.trim()
@@ -202,6 +192,29 @@ fun OnlineScreen(activity: MainActivity) {
                 error = e.message ?: "Search failed"
             }
             searching = false
+        }
+    }
+
+    LaunchedEffect(query) {
+        suggestions = emptyList()
+        val typed = query.trim()
+        if (typed.length < 2) return@LaunchedEffect
+        kotlinx.coroutines.delay(300)
+        if (typed != query.trim()) return@LaunchedEffect
+        val found = withContext(Dispatchers.IO) { runCatching { OnlineApi.suggest(typed) }.getOrDefault(emptyList()) }
+        if (typed == query.trim() && results == null) suggestions = found
+    }
+
+    fun loadRecommended() {
+        scope.launch {
+            loadingRecommended = true
+            try {
+                recommended = withContext(Dispatchers.IO) { OnlineApi.recommended() }
+                error = null
+            } catch (e: Exception) {
+                error = e.message ?: "Could not load recommendations"
+            }
+            loadingRecommended = false
         }
     }
 
@@ -228,7 +241,15 @@ fun OnlineScreen(activity: MainActivity) {
                 leadingIcon = { RIcon(R.drawable.ic_search, tint = Rage.TextDim, size = 20.dp) },
                 trailingIcon = {
                     if (query.isNotEmpty()) {
-                        IconAction(R.drawable.ic_x, { query = ""; results = null; error = null }, tint = Rage.TextDim, size = 18.dp, contentDescription = "Clear")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconAction(R.drawable.ic_x, { query = ""; results = null; error = null; suggestions = emptyList() }, tint = Rage.TextDim, size = 18.dp, contentDescription = "Clear")
+                            Spacer(Modifier.width(6.dp))
+                            Box(
+                                Modifier.clip(RoundedCornerShape(50)).background(Rage.Accent)
+                                    .clickable { suggestions = emptyList(); search() }
+                                    .padding(horizontal = 12.dp, vertical = 7.dp)
+                            ) { Text("Go", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                        }
                     }
                 },
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
@@ -245,6 +266,31 @@ fun OnlineScreen(activity: MainActivity) {
                 ),
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)
             )
+        }
+
+        // Search suggestions: tap one to complete the word and search it right away.
+        if (results == null && suggestions.isNotEmpty()) {
+            item(key = "suggestions") {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                    Text("Did you mean", color = Rage.TextDim, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.height(4.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(suggestions, key = { "s-" + it }) { word ->
+                            Box(
+                                Modifier.clip(RoundedCornerShape(50)).background(Rage.SurfaceHigh)
+                                    .clickable {
+                                        query = word
+                                        suggestions = emptyList()
+                                        search()
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                            ) {
+                                Text(word, color = Rage.Accent, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Now playing

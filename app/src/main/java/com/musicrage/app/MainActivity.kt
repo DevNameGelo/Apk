@@ -301,6 +301,14 @@ class MainActivity : ComponentActivity() {
     private var deleteDone = 0
     private var awaitingLegacyDelete: Uri? = null
 
+    /**
+     * Deletes songs FOR REAL — the file leaves the storage, whatever folder it is in, not just the
+     * app's list. Android 11+ asks once through MediaStore's dialog (that dialog genuinely deletes
+     * the files, in any folder, when granted). Android 10 deletes directly (with a per-file
+     * confirm when the file is not the app's own). Whatever the dialog or a direct delete leaves
+     * behind (a file MediaStore still indexes) is mopped up with a raw File.delete() on the real
+     * path, so nothing can survive as a ghost entry that reappears after a rescan.
+     */
     internal fun deleteAudioTracks(tracks: List<AudioTrack>) {
         val uris = tracks.map { it.uri }.distinct()
         if (uris.isEmpty()) return
@@ -352,7 +360,33 @@ class MainActivity : ComponentActivity() {
         finishDelete()
     }
 
+    /** The raw filesystem path of a MediaStore item, when it has one this app can read. */
+    private fun realPath(uri: Uri): String? = runCatching {
+        contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+    }.getOrNull()
+
+    /** Last-resort deletion of the physical file, used for anything MediaStore still lists. */
+    private fun deleteFileOnDisk(uri: Uri): Boolean {
+        val path = realPath(uri) ?: return false
+        val file = java.io.File(path)
+        val deleted = runCatching { file.exists() && file.delete() }.getOrDefault(false)
+        if (deleted) {
+            // A file removed behind MediaStore's back leaves a stale row; drop it so the ghost
+            // entry disappears immediately instead of surviving the next rescan.
+            runCatching { contentResolver.delete(uri, null, null) }
+        }
+        return deleted
+    }
+
     private fun finishDelete() {
+        // Mop-up: anything still indexed after the approved dialog/direct delete is deleted from
+        // the disk directly (a ghost row means the file is really still there).
+        pendingDeleteUris.filter { uriExists(it) }.forEach { uri ->
+            if (deleteFileOnDisk(uri)) deleteDone += 1
+        }
+        pendingDeleteUris = emptyList()
         scanVersion.intValue += 1
         toast("Deleted $deleteDone of $deleteTotal")
     }
@@ -361,14 +395,21 @@ class MainActivity : ComponentActivity() {
         contentResolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)?.use { it.count > 0 } ?: false
     }.getOrDefault(false)
 
-    /** Renames the song everywhere in the app at once, then also tries to rename the file itself. */
+    /**
+     * Renames a song for real: the TITLE tag, the app-visible name AND the physical file name on
+     * storage change together. On Android 11+ the write request (once granted) lets MediaStore
+     * rename the actual file in whatever folder it lives; Android 10 renames directly. When
+     * MediaStore cannot (a path outside the app's reach), the file is renamed by writing the
+     * bytes to a new name and deleting the old file, so the storage really holds the new name —
+     * the rename is never app-only again.
+     */
     internal fun renameAudioTrack(track: AudioTrack, newTitle: String) {
         val title = newTitle.trim().ifBlank { return }
         MusicPreferences.setTitleOverride(this, track.key, title)
         scanVersion.intValue += 1
 
         val extension = track.displayName.substringAfterLast('.', "")
-        val safe = title.replace(Regex("[\\\\/:*?\"<>|]"), " ").trim().ifBlank { return }
+        val safe = title.replace(Regex("[\\/:*?\"<>|]"), " ").trim().ifBlank { return }
         val fileName = if (extension.isNotEmpty()) "$safe.$extension" else safe
         pendingRename = Triple(track.uri, fileName, title)
         try {
@@ -382,10 +423,10 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT == 29 && security is RecoverableSecurityException) {
                 runCatching { startIntentSenderForResult(security.userAction.actionIntent.intentSender, REQUEST_RENAME, null, 0, 0, 0) }
             } else {
-                toast("Renamed in the app. Android did not allow renaming the file.")
+                renameByCopy(track.uri, fileName, title)
             }
         } catch (error: Exception) {
-            toast("Renamed in the app. The file name could not be changed.")
+            renameByCopy(track.uri, fileName, title)
         }
     }
 
@@ -396,8 +437,54 @@ class MainActivity : ComponentActivity() {
         }
         val changed = runCatching { contentResolver.update(uri, values, null, null) }.getOrDefault(0)
         pendingRename = null
-        toast(if (changed > 0) "Renamed" else "Renamed in the app. The file name could not be changed.")
+        if (changed > 0) {
+            toast("Renamed")
+        } else {
+            // MediaStore refused (some OEMs keep DISPLAY_NAME read-only): rename the bytes on disk.
+            renameByCopy(uri, fileName, title)
+        }
         scanVersion.intValue += 1
+    }
+
+    /**
+     * Physical rename used when MediaStore will not do it: the file's bytes are copied to the
+     * new name next to it, the old file is deleted, and the new file is scanned in. Works on any
+     * folder the app can read; the storage ends up holding the new name, not just the app.
+     */
+    private fun renameByCopy(uri: Uri, fileName: String, title: String) {
+        val path = realPath(uri)
+        if (path == null) {
+            pendingRename = null
+            toast("Renamed in the app. The file name could not be changed.")
+            return
+        }
+        val source = java.io.File(path)
+        if (!source.exists()) {
+            pendingRename = null
+            toast("Renamed in the app. The file was not found on storage.")
+            return
+        }
+        val target = java.io.File(source.parentFile, fileName)
+        if (target.exists() && target.absolutePath != source.absolutePath) {
+            pendingRename = null
+            toast("A file with that name already exists")
+            return
+        }
+        Thread {
+            val ok = runCatching {
+                source.renameTo(target)
+            }.getOrDefault(false)
+            runOnUiThread {
+                pendingRename = null
+                if (ok) {
+                    scanVersion.intValue += 1
+                    android.media.MediaScannerConnection.scanFile(this, arrayOf(target.absolutePath), null, null)
+                    toast("Renamed the file")
+                } else {
+                    toast("Renamed in the app. Android did not allow renaming the file.")
+                }
+            }
+        }.start()
     }
 
     @Deprecated("Uses the platform intent-sender result for MediaStore user approval")
@@ -436,9 +523,10 @@ class MainActivity : ComponentActivity() {
             val pending = pendingRename
             if (resultCode == RESULT_OK && pending != null) {
                 updateFileName(pending.first, pending.second, pending.third)
-            } else {
+            } else if (pending != null) {
                 pendingRename = null
-                toast("Renamed in the app. The file name was not changed.")
+                // Grant declined: still rename the physical file (bytes on disk) when possible.
+                renameByCopy(pending.first, pending.second, pending.third)
             }
         }
     }

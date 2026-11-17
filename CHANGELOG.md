@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.20
+- Search now finds what SoundCloud's site finds: the query is retried with filler words ("and", "official"…) and then with trailing words dropped, so "Terenova cakes and eclairs" returns the artist's songs instead of nothing. Artist profiles and playlists in the results are expanded in — a playlist named after the song you typed (e.g. "kalapastanganan") contributes its tracks, and an artist profile contributes their uploads.
+- The original/official upload now ranks first: results are ordered by how exactly the title matches the query, with covers, sped-up and remix versions ranked down and popularity as the tie-breaker. Official label uploads with an encrypted stream play fine (the widget decrypts them itself), so they no longer sink below covers — "ako ang bagyo" shows SHEAN's original at the top.
+- Search auto-correct while typing: SoundCloud's own query completion suggests full names as you type ("kalapa" suggests "kalapastanganan", "ako ang b" suggests "ako ang bagyo"). Tap a suggestion to search it straight away; a Go button next to the field runs the search too.
+- The Online tab now keeps playing online music forever: when a song ends the next one comes from SoundCloud's own "related tracks" for that song (the same list the site's station uses), falling back to the same-artist / similar / favourite-artist ladder only when that is empty. It never switches back to local downloads.
+- Downloads now carry the album art: the m4a save writes a proper MP4 cover atom (moov/udta/meta/ilst/covr) and the converter MP3 gets an ID3 APIC frame, so saved songs show their cover in the library instead of a grey tile.
+- The hidden player is now truly invisible: alpha 0 and parked off-screen, so no faint square shows on black screens any more.
+- Deleting a song now really deletes the file from storage (any folder), not just from the app's list: after the system delete dialog, anything still indexed is wiped from disk directly so no ghost entry survives a rescan.
+- Renaming a song now really renames the file on storage: MediaStore renames the physical file (with the write grant on Android 11+), and when it refuses, the file itself is renamed on disk and rescanned — the new name is what every other app sees, not just Music Rage.
+
 ## 1.2.19
 - Fixed the crash when opening the Online tab (or right after start-up): entries saved by earlier versions had no stored length, and reading one back produced a corrupted number that Android's JSON writer refuses to save — the crash fired the moment the app rewrote history or the resume pointer. Unknown lengths now read as 0 and are saved as 0 instead of the value that crashed.
 
