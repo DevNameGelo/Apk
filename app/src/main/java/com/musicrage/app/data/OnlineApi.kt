@@ -23,7 +23,8 @@ import java.util.Locale
 
 /**
  * A song found on SoundCloud. [id] is the numeric track id, [permalink] its soundcloud.com path,
- * [hls] the HLS playlist URL (empty until first played), [duration] the track length in seconds.
+ * [duration] the track length in seconds, [playable] whether it has a stream the app can use
+ * (plain HLS/progressive — not the login-only encrypted one).
  */
 data class OnlineVideo(
     val id: String,
@@ -31,7 +32,8 @@ data class OnlineVideo(
     val channel: String,
     val thumb: String,
     val permalink: String = "",
-    val duration: Double = 0.0
+    val duration: Double = 0.0,
+    val playable: Boolean = true
 )
 
 object OnlineApi {
@@ -159,12 +161,29 @@ object OnlineApi {
             channel = t.optJSONObject("user")?.optString("username").orEmpty(),
             thumb = artwork,
             permalink = "https://soundcloud.com" + t.optString("permalink_uri", t.optString("permalink")),
-            duration = t.optDouble("duration", 0.0) / 1000.0
+            // A preview-only track reports its preview length, not the full one.
+            duration = (t.optDouble("full_duration", 0.0).takeIf { it > 0 } ?: t.optDouble("duration", 0.0)) / 1000.0,
+            playable = hasPlayableTranscoding(t)
         )
     }
 
-    /** Search SoundCloud for tracks (songs only). */
-    fun search(query: String): List<OnlineVideo> {
+    /**
+     * True when the track has a stream this app can actually use: a plain HLS or progressive rendition.
+     * Label-provided tracks only offer AES-encrypted HLS (needs a SoundCloud login to decrypt), and preview-only
+     * tracks give a 30-second snippet — both would "play" then stall, so they are treated as not playable.
+     */
+    private fun hasPlayableTranscoding(t: JSONObject): Boolean {
+        if (t.optBoolean("snipped", false)) return false
+        val transcodings = t.optJSONObject("media")?.optJSONArray("transcodings") ?: return false
+        for (i in 0 until transcodings.length()) {
+            val protocol = transcodings.optJSONObject(i)?.optJSONObject("format")?.optString("protocol").orEmpty()
+            if (protocol == "hls" || protocol == "progressive") return true
+        }
+        return false
+    }
+
+    /** Search SoundCloud for tracks (songs only), keeping only what can genuinely play. */
+    fun search(query: String, playableOnly: Boolean = true): List<OnlineVideo> {
         val text = query.trim()
         val raw = soundcloudGet("/search?q=${encode(text)}&limit=25&variant=generic")
         val collection = JSONObject(raw).optJSONArray("collection") ?: return emptyList()
@@ -175,7 +194,10 @@ object OnlineApi {
             val video = fromTrack(item)
             if (video.id.isNotEmpty() && video.title.isNotBlank() && !out.containsKey(video.id)) out[video.id] = video
         }
-        return out.values.toList()
+        val results = out.values.toList()
+        val playable = results.filter { it.playable }
+        // A query whose results are all encrypted/previews falls back to them rather than showing nothing.
+        return if (playableOnly && playable.isNotEmpty()) playable else results
     }
 
     fun recommended(): List<OnlineVideo> = search("popular music")
@@ -214,16 +236,21 @@ object OnlineApi {
     /**
      * Downloads a track by fetching its HLS segments (init.mp4 + media .m4s chunks) and joining them into
      * a single playable MP4 stream. Works with plain HTTP and needs no converter service. Returns null
-     * when the track has no HLS rendition.
+     * when the track has no usable HLS rendition (or it cannot be fetched).
      */
-    fun downloadHlsAudio(context: Context, video: OnlineVideo, progress: (Int) -> Unit): ByteArray? {
+    fun downloadHlsAudio(context: Context, video: OnlineVideo, progress: (Int) -> Unit): DownloadedAudio? {
         val playlist = hlsPlaylist(video.id) ?: return null
         progress(10)
         val body = get(playlist, browser = true)
         progress(20)
+        // An encrypted playlist is useless without a SoundCloud login: hand it back to the converter.
+        if (body.contains("#EXT-X-KEY:METHOD=")) return null
         val initUrl = Regex("#EXT-X-MAP:URI=\"([^\"]+)\"").find(body)?.groupValues?.get(1)
         val segments = body.split("\n").map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
         if (segments.isEmpty()) return null
+        // The true length of the audio, from the playlist itself — NOT the track metadata, which for
+        // preview tracks claims far more than the audio actually holds.
+        val seconds = Regex("#EXTINF:([\\d.]+)").findAll(body).map { it.groupValues[1].toDouble() }.sum()
         val out = ByteArrayOutputStream()
         // The init segment carries the MP4 headers; without it the file will not decode.
         if (initUrl != null) {
@@ -239,8 +266,11 @@ object OnlineApi {
         progress(90)
         val audio = out.toByteArray()
         if (audio.size < 20_000) return null
-        return audio
+        return DownloadedAudio(audio, seconds)
     }
+
+    /** What a native download produced: the audio bytes plus the length the playlist really holds. */
+    class DownloadedAudio(val bytes: ByteArray, val seconds: Double)
 
     // ---- File saves ---------------------------------------------------------------
 
@@ -264,7 +294,7 @@ object OnlineApi {
     var downloadVersion: Int by mutableIntStateOf(0)
         private set
 
-    fun saveM4a(context: Context, bytes: ByteArray, video: OnlineVideo) {
+    fun saveM4a(context: Context, bytes: ByteArray, video: OnlineVideo, seconds: Double) {
         val safe = safeName(video)
         val resolver = context.contentResolver
         val values = ContentValues().apply {
@@ -276,7 +306,9 @@ object OnlineApi {
             put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/Music Rage")
             put(MediaStore.Audio.Media.IS_PENDING, 1)
             put(MediaStore.Audio.Media.IS_MUSIC, 1)
-            put(MediaStore.Audio.Media.DURATION, (video.duration * 1000).toLong())
+            // The length the HLS playlist really holds, not the track's advertised one (which can be a
+            // preview length or an over-estimate); the media scanner corrects it after the save anyway.
+            if (seconds > 0) put(MediaStore.Audio.Media.DURATION, (seconds * 1000).toLong())
         }
         val target = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
             ?: throw ApiException("Save failed: could not create the file")
@@ -336,15 +368,15 @@ object OnlineApi {
         say(context, "Preparing download…")
         downloadScope.launch {
             try {
-                val bytes = downloadHlsAudio(context, video) { setProgress(it) }
-                if (bytes != null && bytes.size > 20_000) {
+                val native = downloadHlsAudio(context, video) { setProgress(it) }
+                if (native != null && native.bytes.size > 20_000) {
                     say(context, "Downloading…")
-                    saveM4a(context, bytes, video)
+                    saveM4a(context, native.bytes, video, native.seconds)
                     setProgress(100)
                     say(context, "Saved to Music/Music Rage")
                 } else {
-                    // Native HLS failed (track needs purchase or is restricted): try the converter with
-                    // the track's SoundCloud page.
+                    // Native HLS failed (encrypted-only track, preview, restricted): try the converter
+                    // with the track's SoundCloud page.
                     val link = prepareMp3(video.permalink.ifEmpty { "https://soundcloud.com" })
                     say(context, "Downloading…")
                     saveMp3(context, link, video)
@@ -484,7 +516,8 @@ object OnlineApi {
             put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/Music Rage")
             put(MediaStore.Audio.Media.IS_PENDING, 1)
             put(MediaStore.Audio.Media.IS_MUSIC, 1)
-            put(MediaStore.Audio.Media.DURATION, (video.duration * 1000).toLong())
+            // No DURATION here: the converter's file is whatever length it actually is, and the
+            // media scanner fills the true value in once the file is complete.
         }
         val target = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
             ?: throw ApiException("Save failed: could not create the file")

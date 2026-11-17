@@ -74,11 +74,19 @@ object OnlineStore {
 
     private fun prefs(context: Context) = context.getSharedPreferences(MusicPreferences.FILE, Context.MODE_PRIVATE)
 
-    private fun toJson(video: OnlineVideo) =
-        JSONObject().put("id", video.id).put("title", video.title).put("channel", video.channel).put("thumb", video.thumb)
+    private fun toJson(video: OnlineVideo) = JSONObject()
+        .put("id", video.id).put("title", video.title).put("channel", video.channel).put("thumb", video.thumb)
+        .put("permalink", video.permalink).put("duration", video.duration).put("playable", video.playable)
 
-    private fun fromJson(obj: JSONObject) =
-        OnlineVideo(obj.optString("id"), obj.optString("title"), obj.optString("channel"), obj.optString("thumb"))
+    private fun fromJson(obj: JSONObject) = OnlineVideo(
+        obj.optString("id"),
+        obj.optString("title"),
+        obj.optString("channel"),
+        obj.optString("thumb"),
+        obj.optString("permalink"),
+        obj.optDouble("duration"),
+        obj.optBoolean("playable", true)
+    )
 
     fun saveLast(context: Context, video: OnlineVideo, positionSec: Double) {
         prefs(context).edit().putString(KEY_LAST, toJson(video).toString()).putFloat(KEY_POSITION, positionSec.toFloat()).apply()
@@ -456,8 +464,11 @@ object OnlinePlayer {
     /** SoundCloud hosts plus the few CDN/API hosts the widget and artworks genuinely need. */
     private fun isAllowedHost(host: String): Boolean {
         val h = host.lowercase()
-        if (h.endsWith("soundcloud.com") || h.endsWith("sndcdn.com") || h.endsWith("sc-cdn.net") ||
-            h.endsWith("soundusercontent.com") || h.endsWith("akamaized.net") || h.endsWith("cloudfront.net")
+        // The audio itself is delivered from SoundCloud's media CDN (playback.media-streaming.soundcloud.cloud)
+        // and, for some tracks, its CDN partners — all of these must pass or the widget plays nothing.
+        if (h.endsWith("soundcloud.com") || h.endsWith("soundcloud.cloud") || h.endsWith("sndcdn.com") ||
+            h.endsWith("sc-cdn.net") || h.endsWith("soundusercontent.com") || h.endsWith("akamaized.net") ||
+            h.endsWith("cloudfront.net") || h.endsWith("media-streaming.soundcloud.cloud")
         ) {
             // Refuse the known ad-serving subdomains even inside otherwise-allowed domains.
             val adMarkers = listOf("ads", "adserver", "admob", "doubleclick", "googlesyndication", "adservice", "partnerads", "promote", "impression")
@@ -788,8 +799,10 @@ object OnlinePlayer {
                     context?.let { OnlineStore.setAlive(it, true) }
                 }
                 2 -> {
+                    // A pause does NOT clear the alive marker: the widget fires stray pauses right after
+                    // starting a song, and clearing here would disable crash recovery while the music
+                    // is still going. The heartbeat stops marking the session only on a real stop().
                     state = state.copy(isPlaying = false)
-                    context?.let { OnlineStore.setAlive(it, false) }
                 }
                 0 -> onTrackEnded(context)
             }
@@ -820,7 +833,7 @@ object OnlinePlayer {
         val noise = listOf("hours", "hour mix", "top 100", "top 50", "top 20", "top 10", "playlist", " mix", "compilation",
             "nonstop", "non-stop", "non stop", "full album", "best of", "jukebox", "24/7", "live stream", "hits 20", "trending",
             "podcast", "episode", "interview", "set #", "dj set", "recording", "snippet", "preview")
-        return title.length < 140 && noise.none { title.contains(it) }
+        return title.length < 140 && noise.none { title.contains(it) } && video.playable
     }
 
     /**

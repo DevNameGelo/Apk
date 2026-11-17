@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.18
+- Fixed songs that showed 0 duration and never played: SoundCloud delivers its audio from a CDN host (playback.media-streaming.soundcloud.cloud) the player sandbox was refusing. The sandbox now allows SoundCloud's media delivery hosts, so streams actually reach the widget.
+- Fixed songs that stopped after ~30 seconds while the card still said "playing": the pause marker written by a stray widget event disabled crash recovery and could also make the watchdog treat a healthy song as frozen. Pauses no longer clear the recovery marker.
+- Label-uploaded songs (e.g. some versions of "Ako ang Bagyo") only offer an encrypted stream that cannot play without a SoundCloud login — they are now filtered out of search results and auto-next picks, so what the app offers always really plays. If every result for a query is that kind, they are still shown rather than nothing.
+- Downloaded songs no longer claim a length the audio does not have: the saved duration now comes from the stream's own playlist (the sum of its segments), and the library lets the media scanner correct it, so a 3-minute card no longer stops at 30 seconds. Encrypted previews fall back to the converter instead of saving a broken file.
+
 ## 1.2.17
 - SoundCloud everywhere instead of YouTube: search, playback and cover art all come from SoundCloud now. The old YouTube player (embed, watch-page fallback, ad skipping, embed-block list) is gone — no more "This video can't be played", no ads, no embed-blocked songs. The player is the official SoundCloud widget, which plays every public track.
 - Downloads straight from SoundCloud: the song's stream is fetched segment by segment from SoundCloud's CDN and saved as a single file (m4a) in Music/Music Rage, with the real title, artist and duration in the library. The old MP3 converter stays as a fallback for restricted songs (it accepts SoundCloud links too), so the download button keeps working the same way.
