@@ -15,6 +15,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -232,11 +233,17 @@ object OnlineStore {
         taste(context).entries.filter { it.value > 0 }.sortedByDescending { it.value }.take(limit).map { it.key }
 
     /** Videos that could not be played even after every repair step; autoplay never picks them again. */
-    fun dead(context: Context): Set<String> =
-        prefs(context).getStringSet(KEY_DEAD, emptySet())?.toSet() ?: emptySet()
+    fun dead(context: Context): Set<String> {
+        val limit = System.currentTimeMillis() - 7L * 24L * 3600L * 1000L
+        return (prefs(context).getStringSet(KEY_DEAD, emptySet()) ?: emptySet()).mapNotNull { entry ->
+            val at = entry.substringAfter('@', "").toLongOrNull()
+            if (at != null && at > limit) entry.substringBefore('@') else null
+        }.toSet()
+    }
 
     fun addDead(context: Context, id: String) {
-        prefs(context).edit().putStringSet(KEY_DEAD, dead(context) + id).apply()
+        val keep = (prefs(context).getStringSet(KEY_DEAD, emptySet()) ?: emptySet()).filter { !it.startsWith("$id@") }
+        prefs(context).edit().putStringSet(KEY_DEAD, (keep + "$id@${System.currentTimeMillis()}").takeLast(80).toSet()).apply()
     }
 
     /** Small ring buffer of what the watchdog saw and fixed. Never shown; kept for diagnosis. */
@@ -454,6 +461,15 @@ object OnlinePlayer {
             }
         }
         view.webChromeClient = object : WebChromeClient() {
+            // Label-uploaded songs are delivered as protected (DRM) streams. The page asks for protected-media
+            // access, and without this grant those songs show up but never start.
+            override fun onPermissionRequest(request: PermissionRequest) {
+                val host = request.origin?.host.orEmpty().lowercase()
+                val trusted = host.endsWith("soundcloud.com") || host.endsWith("soundcloud.cloud") || host.endsWith("sndcdn.com")
+                val granted = request.resources.filter { it == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID }
+                if (trusted && granted.isNotEmpty()) request.grant(granted.toTypedArray()) else request.deny()
+            }
+
             // A sandboxed player never opens new windows: every pop-up dies here.
             override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, result: android.os.Message): Boolean {
                 // Returning false refuses the window; nothing is sent through the result message.
@@ -640,6 +656,7 @@ object OnlinePlayer {
         queue = listOf(video)
         index = 0
         userInitiated = true
+        swapCount = 0
         startVideo(video, 0.0, true)
     }
 
@@ -695,7 +712,7 @@ object OnlinePlayer {
         val token = watchToken
         main.postDelayed({
             if (token == watchToken && gen == generation && OnlineLoading.active) healFailure(gen)
-        }, 25_000L)
+        }, 12_000L)
     }
 
     /**
@@ -709,8 +726,8 @@ object OnlinePlayer {
         healStage += 1
         OnlineStore.log(context, "heal $healStage ${video.id}")
         when (healStage) {
-            1 -> startVideo(video, positionSec, false, heal = true)
-            2 -> {
+            1 -> {
+                // One clean retry: reload the whole player page, then the song.
                 pageReady = false
                 web?.let { loadEmbedPage(it) }
                 startVideo(video, positionSec, false, heal = true)
@@ -734,9 +751,46 @@ object OnlinePlayer {
                 autoplaySimilar(context)
             }
         } else {
+            // The song the person chose cannot play here. Instead of leaving a dead play button, quietly play
+            // another upload of the same song.
+            OnlineStore.removeHistory(context, video.id)
+            swapForAlternative(video)
+        }
+    }
+
+    private var swapCount = 0
+
+    private fun swapForAlternative(video: OnlineVideo) {
+        val context = appContext ?: return
+        if (autoplayBusy || swapCount >= 3) {
+            OnlineLoading.active = false
             state = state.copy(isPlaying = false)
             listener?.invoke()
+            return
         }
+        autoplayBusy = true
+        swapCount += 1
+        val gen = generation
+        val avoid = OnlineStore.dead(context)
+        OnlineLoading.active = true
+        Thread {
+            val alternative = runCatching { com.musicrage.app.data.OnlineApi.alternatives(video, avoid) }
+                .getOrDefault(emptyList()).firstOrNull()
+            main.post {
+                autoplayBusy = false
+                if (gen != generation) return@post
+                if (alternative == null) {
+                    OnlineLoading.active = false
+                    state = state.copy(isPlaying = false)
+                    listener?.invoke()
+                } else {
+                    queue = listOf(alternative)
+                    index = 0
+                    userInitiated = true
+                    startVideo(alternative, 0.0, false)
+                }
+            }
+        }.start()
     }
 
     private fun jsPlay() = runJs("playVideo2()")
@@ -986,7 +1040,7 @@ object OnlinePlayer {
         }
         if (OnlineLoading.active) {
             if (loadingSince == 0L) loadingSince = now
-            if (now - loadingSince > 14_000L) {
+            if (now - loadingSince > 9_000L) {
                 loadingSince = now
                 healFailure(generation)
             }

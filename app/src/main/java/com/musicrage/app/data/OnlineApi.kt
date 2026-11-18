@@ -178,11 +178,21 @@ object OnlineApi {
      */
     private fun hasPlayableTranscoding(t: JSONObject): Boolean {
         if (t.optBoolean("snipped", false)) return false
-        if (t.optString("policy").equals("GO_PLUS", ignoreCase = true)) return false
+        // SoundCloud's own flags (see the API docs: access is playable / preview / blocked, and the track
+        // policy says whether a full stream is allowed). Only a fully playable track counts.
+        val policy = t.optString("policy")
+        if (policy.equals("GO_PLUS", ignoreCase = true) || policy.equals("BLOCK", ignoreCase = true) ||
+            policy.equals("SNIP", ignoreCase = true)
+        ) return false
+        val access = t.optString("access")
+        if (access.equals("blocked", ignoreCase = true) || access.equals("preview", ignoreCase = true)) return false
         if (t.optBoolean("streamable", true) == false) return false
         val transcodings = t.optJSONObject("media")?.optJSONArray("transcodings") ?: return false
         for (i in 0 until transcodings.length()) {
-            val protocol = transcodings.optJSONObject(i)?.optJSONObject("format")?.optString("protocol").orEmpty()
+            val transcoding = transcodings.optJSONObject(i) ?: continue
+            // A transcoding marked snipped is the 30-second preview, not the song.
+            if (transcoding.optBoolean("snipped", false)) continue
+            val protocol = transcoding.optJSONObject("format")?.optString("protocol").orEmpty()
             if (protocol == "hls" || protocol == "progressive" ||
                 protocol == "cbc-encrypted-hls" || protocol == "ctr-encrypted-hls"
             ) return true
@@ -213,6 +223,8 @@ object OnlineApi {
             val lower = v.title.lowercase()
             if (coverMarkers.any { lower.contains(it) }) s -= 45
             if (channel.contains(q) && q.isNotEmpty()) s += 40
+            // "terenova cakes and eclairs": the artist named inside a longer query still counts.
+            else if (channel.length >= 3 && q.contains(channel)) s += 40
             for (w in words) {
                 if (title.contains(w)) s += 10
                 if (channel.contains(w)) s += 5
@@ -281,12 +293,101 @@ object OnlineApi {
             val tracks = runCatching { userTracks(id) }.getOrDefault(emptyList())
             for (video in tracks) if (video.id !in out) out[video.id] = video
         }
+        // The artist the query names ("terenova"): SoundCloud's site shows the profile first, so do the same.
+        for (video in runCatching { searchArtistTracks(text) }.getOrDefault(emptyList())) {
+            if (video.id !in out) out[video.id] = video
+        }
+        // Few track hits in the mixed list: ask the track-only search as well.
+        if (out.size < 8) {
+            for (attempt in attempts.take(3)) {
+                val raw = runCatching { soundcloudGet("/search/tracks?q=${encode(attempt)}&limit=30") }.getOrNull() ?: continue
+                val items = runCatching { JSONObject(raw).optJSONArray("collection") }.getOrNull() ?: continue
+                var added = 0
+                for (i in 0 until items.length()) {
+                    val item = items.optJSONObject(i) ?: continue
+                    val video = fromTrack(item)
+                    if (video.id.isNotEmpty() && video.title.isNotBlank() && video.id !in out) {
+                        out[video.id] = video
+                        added += 1
+                    }
+                }
+                if (added > 0) break
+            }
+        }
         var results = out.values.toList()
         if (playableOnly) {
             val playable = results.filter { it.playable }
             if (playable.isNotEmpty()) results = playable
         }
         return rankByRelevance(text, results)
+    }
+
+    /**
+     * People whose name matches the query (SoundCloud's /search/users), with their most popular uploads.
+     * "terenova" returns the artist Terenova and her songs even when the mixed search buried the profile.
+     */
+    private fun searchArtistTracks(text: String): List<OnlineVideo> {
+        val q = normalize(text)
+        val words = q.split(" ").filter { it.length >= 3 }
+        val queries = LinkedHashSet<String>()
+        queries.add(text)
+        words.firstOrNull()?.let { queries.add(it) }
+        val chosen = LinkedHashSet<String>()
+        for (query in queries) {
+            val raw = runCatching { soundcloudGet("/search/users?q=${encode(query)}&limit=6") }.getOrNull() ?: continue
+            val items = runCatching { JSONObject(raw).optJSONArray("collection") }.getOrNull() ?: continue
+            for (i in 0 until items.length()) {
+                val user = items.optJSONObject(i) ?: continue
+                val name = normalize(user.optString("username"))
+                val full = normalize(user.optString("full_name"))
+                val hit = name.length >= 3 && (
+                    q == name || q.contains(name) || name == words.firstOrNull() ||
+                        (words.isNotEmpty() && words.all { w -> name.contains(w) || full.contains(w) })
+                    )
+                if (hit) chosen.add(user.optLong("id").toString())
+            }
+        }
+        val out = ArrayList<OnlineVideo>()
+        for (id in chosen.take(2)) {
+            var tracks = runCatching { userTopTracks(id) }.getOrDefault(emptyList())
+            if (tracks.isEmpty()) tracks = runCatching { userTracks(id) }.getOrDefault(emptyList())
+            out.addAll(tracks)
+        }
+        return out
+    }
+
+    private fun userTopTracks(userId: String): List<OnlineVideo> {
+        val raw = soundcloudGet("/users/$userId/toptracks?limit=15")
+        val array = JSONObject(raw).optJSONArray("collection") ?: return emptyList()
+        val out = ArrayList<OnlineVideo>()
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            val video = fromTrack(item)
+            if (video.id.isNotEmpty() && video.title.isNotBlank()) out.add(video)
+        }
+        return out
+    }
+
+    /**
+     * Other uploads of the same song, best match first. Used when a song cannot play on this phone: instead of
+     * leaving a dead play button, the app quietly plays another playable version (the artist's own re-upload,
+     * a lyric video, etc.).
+     */
+    fun alternatives(video: OnlineVideo, avoid: Set<String>): List<OnlineVideo> {
+        val noise = setOf("official", "audio", "lyrics", "lyric", "video", "music", "hd", "hq", "feat", "ft")
+        val words = normalize(video.title).split(" ").filter { it.length > 2 && it !in noise }
+        if (words.isEmpty()) return emptyList()
+        val found = LinkedHashMap<String, OnlineVideo>()
+        for (query in listOf("${video.title} ${video.channel}", video.title)) {
+            for (candidate in runCatching { search(query) }.getOrDefault(emptyList())) {
+                found.putIfAbsent(candidate.id, candidate)
+            }
+        }
+        return found.values.filter { candidate ->
+            val title = normalize(candidate.title)
+            candidate.playable && candidate.id != video.id && candidate.id !in avoid &&
+                words.count { title.contains(it) } >= Math.ceil(words.size * 0.6).toInt()
+        }
     }
 
     /** The query as typed, then filler words dropped, then trailing words dropped. */
@@ -327,7 +428,7 @@ object OnlineApi {
 
     /** The uploads of one artist profile. */
     private fun userTracks(userId: String): List<OnlineVideo> {
-        val raw = soundcloudGet("/users/$userId/tracks?limit=10")
+        val raw = soundcloudGet("/users/$userId/tracks?limit=15")
         val array = JSONObject(raw).optJSONArray("collection") ?: return emptyList()
         val out = ArrayList<OnlineVideo>()
         for (i in 0 until array.length()) {

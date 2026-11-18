@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.21
+- Songs that showed up but never played (the play button stayed on pause): label-uploaded songs arrive as protected (DRM) streams, and the hidden player never granted the protected-media permission the page asks for, so those streams could not start. The player now grants it to SoundCloud pages only.
+- The playable check now follows SoundCloud's own flags: a track whose access is preview or blocked, whose policy is SNIP or BLOCK, or whose only streams are marked snipped (30-second previews) no longer counts as playable. Playable songs are listed first.
+- A song that still cannot start is no longer left as a dead button: after a quick retry (about 10 seconds, down from 25) the app quietly plays another upload of the same song, removes the dead one from Continue playing, and hides it from search results for a week.
+- Search now finds artists the way the SoundCloud site does: an explicit people search ("terenova") brings in that artist's most popular songs, an artist named inside a longer query still ranks their songs first, and a plain track search backs up the mixed search when it returns few songs.
+
 ## 1.2.20
 - Search now finds what SoundCloud's site finds: the query is retried with filler words ("and", "official"…) and then with trailing words dropped, so "Terenova cakes and eclairs" returns the artist's songs instead of nothing. Artist profiles and playlists in the results are expanded in — a playlist named after the song you typed (e.g. "kalapastanganan") contributes its tracks, and an artist profile contributes their uploads.
 - The original/official upload now ranks first: results are ordered by how exactly the title matches the query, with covers, sped-up and remix versions ranked down and popularity as the tie-breaker. Official label uploads with an encrypted stream play fine (the widget decrypts them itself), so they no longer sink below covers — "ako ang bagyo" shows SHEAN's original at the top.

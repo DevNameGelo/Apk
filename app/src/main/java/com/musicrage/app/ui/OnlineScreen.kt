@@ -187,7 +187,11 @@ fun OnlineScreen(activity: MainActivity) {
             searching = true
             error = null
             try {
-                results = withContext(Dispatchers.IO) { OnlineApi.search(text) }
+                results = withContext(Dispatchers.IO) {
+                    val found = OnlineApi.search(text)
+                    val dead = OnlineStore.dead(activity)
+                    found.filter { it.id !in dead }.ifEmpty { found }
+                }
             } catch (e: Exception) {
                 error = e.message ?: "Search failed"
             }
