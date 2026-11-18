@@ -430,6 +430,8 @@ object OnlinePlayer {
     private val main = Handler(Looper.getMainLooper())
     private var web: BackgroundWebView? = null
     private var pageReady = false
+    /** True while the WebView shows the real watch page (the fallback for videos the embed refuses). */
+    private var watchMode = false
     private var pendingLoad: Pair<String, Double>? = null
     private var queue: List<OnlineVideo> = emptyList()
     private var index = -1
@@ -545,6 +547,7 @@ object OnlinePlayer {
 
     private fun loadEmbedPage(view: WebView) {
         pageReady = false
+        watchMode = false
         OnlineAdState.showing = false
         view.loadDataWithBaseURL("https://www.youtube.com", PLAYER_HTML, "text/html", "UTF-8", null)
     }
@@ -555,6 +558,7 @@ object OnlinePlayer {
      */
     private fun loadWatchPage(view: WebView, id: String, start: Double) {
         pageReady = true
+        watchMode = true
         view.loadUrl("https://m.youtube.com/watch?v=$id" + if (start > 0) "&t=${start.toInt()}s" else "")
         runJs("javascript:Android.ready()")
         main.postDelayed({ injectWatchJs() }, 1_200L)
@@ -756,8 +760,13 @@ object OnlinePlayer {
         pendingLoad = null
         if (pageReady) {
             // A video blocked in the embed (most official music videos) goes straight to the watch page.
-            if (video.id in OnlineStore::class.java.let { blockedIds(context) }) {
+            if (video.id in blockedIds(context)) {
                 loadWatchPage(view, video.id, startSec)
+            } else if (watchMode) {
+                // Leaving the watch page for a NEW song: the watch page has no load() function, so
+                // without this the click was silently ignored and the old song kept playing.
+                loadEmbedPage(view)
+                pendingLoad = video.id to startSec
             } else {
                 runJs("load('${video.id}',${startSec.toInt()})")
             }
@@ -872,11 +881,13 @@ object OnlinePlayer {
         }.start()
     }
 
+    // The embed page and the watch page expose different control functions; watchMode says which
+    // one is live. (The old URL sniffing also matched the embed page's own iframe URL.)
     private fun jsPlay() = runJs(
-        "try{ if (window.location.href.indexOf('watch') >= 0) { mrPlay(); } else { playVideo2(); } }catch(e){ playVideo2(); }"
+        if (watchMode) "try{ mrPlay(); }catch(e){}" else "try{ playVideo2(); }catch(e){}"
     )
     private fun jsPause() = runJs(
-        "try{ if (window.location.href.indexOf('watch') >= 0) { mrPause(); } else { pauseVideo2(); } }catch(e){ pauseVideo2(); }"
+        if (watchMode) "try{ mrPause(); }catch(e){}" else "try{ pauseVideo2(); }catch(e){}"
     )
 
     fun toggle() {
@@ -921,7 +932,7 @@ object OnlinePlayer {
 
     fun seekTo(seconds: Double) {
         positionSec = seconds
-        runJs("try{ if (window.location.href.indexOf('watch') >= 0) { mrSeek(${seconds.toInt()}); } else { seek(${seconds.toInt()}); } }catch(e){ seek(${seconds.toInt()}); }")
+        runJs(if (watchMode) "try{ mrSeek(${seconds.toInt()}); }catch(e){}" else "try{ seek(${seconds.toInt()}); }catch(e){}")
     }
 
     // ---- Callbacks from the page (called on a WebView thread) ------------------------------------------------------
@@ -930,7 +941,11 @@ object OnlinePlayer {
         main.post {
             pageReady = true
             // The video asked for while the page was still loading is sent to the player now.
-            pendingLoad?.let { runJs("load('${it.first}',${it.second.toInt()})") }
+            // (The embed page is fresh here, so watchMode from the previous watch-page song is off.)
+            pendingLoad?.let {
+                watchMode = false
+                runJs("load('${it.first}',${it.second.toInt()})")
+            }
             pendingLoad = null
         }
     }
@@ -1079,6 +1094,7 @@ object OnlinePlayer {
         val gen = generation
         main.post {
             if (gen != generation) return@post
+            if (!watchMode) return@post
             val current = state.video ?: return@post
             if (id == current.id) return@post
             // The page moved somewhere the app did not send it: adopt that video.

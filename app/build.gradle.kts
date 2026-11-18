@@ -8,6 +8,19 @@ plugins {
 fun signingValue(name: String, fallback: String): String =
     System.getenv(name)?.takeIf { it.isNotBlank() } ?: fallback
 
+// Versioning: the versionName is derived from the versionCode, so the numbers can never disagree.
+// Patch counts up to 1000 before the minor rolls over (1.2.31 … 1.2.1000 -> 1.3.0), and the minor
+// counts up to 10 before the major rolls over (1.9.1000 -> 1.10.0 -> 2.0.0 when the 10th minor is full).
+// 1.2.24 was code 29, so 30 is 1.2.30 (the brief "1.3.0" of code 30 is folded back into the scheme).
+fun versionNameFromCode(code: Int): String {
+    // code 1 = v1.0.0: each code is one patch step, minors hold 1000 patches, majors hold 10 minors.
+    val totalPatches = code - 1
+    val major = 1 + totalPatches / 10_000
+    val minor = (totalPatches % 10_000) / 1_000
+    val patch = totalPatches % 1_000
+    return "$major.$minor.$patch"
+}
+
 android {
     namespace = "com.musicrage.app"
     compileSdk = 37
@@ -16,8 +29,8 @@ android {
         applicationId = "com.musicrage.app"
         minSdk = 29
         targetSdk = 36
-        versionCode = 30
-        versionName = "1.3.0"
+        versionCode = 31
+        versionName = versionNameFromCode(31)
     }
 
     signingConfigs {
