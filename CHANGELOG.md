@@ -1,9 +1,9 @@
 # Changelog
 
-## 1.2.31
+## 1.2.32
 - Fixed: playing a different song while one is already playing sometimes did nothing — the click was silently ignored and the old song kept going (this happened while the player was in its watch-page fallback, which had no way to receive the new song).
 - Fixed: after a song ended and auto-next picked the next one, the mini player and notification kept showing the previous song's title and album art while different music was playing.
-- Version numbering now follows the app's own scheme, derived automatically from the build number: 1.2.31, …, 1.2.1000 → 1.3.0, …, 1.10.1000 → 2.0.0.
+- Version numbering now follows the app's own scheme, derived automatically from the build number: 1.2.32, …, 1.2.999 → 1.3.0, …, 1.10.999 → 2.0.0.
 
 ## 1.3.0
 - The Online tab is back on YouTube: the embedded YouTube player runs in an invisible sandboxed WebView (only YouTube hosts are ever loaded — ads, trackers and pop-ups are refused before their scripts run), the player never shows and never steals taps, and playback keeps running from the notification after the app is swiped away.
