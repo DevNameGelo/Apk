@@ -58,8 +58,7 @@ object Mp4TagWriter {
                     while (at + 8 <= ilst.bodyEnd) {
                         val size = readUint32(m4a, at)
                         if (size < 8 || at + size > ilst.bodyEnd) break
-                        val name = String(m4a, at + 4, 4, Charsets.US_ASCII)
-                        if (name != "©nam" && name != "©ART" && name != "©alb" && name != "covr") {
+                        if (!isMetadataAtom(m4a, at)) {
                             keep.add(slice(m4a, at, at + size))
                         }
                         at += size
@@ -103,34 +102,55 @@ object Mp4TagWriter {
         while (at + 8 <= to) {
             val size = readUint32(data, at)
             if (size < 8 || at + size > to) return null
-            if (String(data, at + 4, 4, Charsets.US_ASCII) == type) return Box(at, size)
+            if (nameAt(data, at) == type) return Box(at, size)
             at += size
         }
         return null
     }
 
+    /** The 4-char name of the box at [at]: plain ASCII letters as-is, the © byte as '©'. */
+    private fun nameAt(data: ByteArray, at: Int): String {
+        val sb = StringBuilder(4)
+        for (i in 0 until 4) {
+            val b = data[at + 4 + i]
+            sb.append(if (b == 0xA9.toByte()) '©' else ((b.toInt() and 0xFF) as Char))
+        }
+        return sb.toString()
+    }
+
+    /** True when the ilst child at [at] is one of the atoms we rewrite (©nam/©ART/©alb/covr). */
+    private fun isMetadataAtom(data: ByteArray, at: Int): Boolean {
+        val name = nameAt(data, at)
+        return name == "©nam" || name == "©ART" || name == "©alb" || name == "covr"
+    }
+
     // ---- Box building ---------------------------------------------------------------------------------------------------
 
     /**
-     * A text metadata atom (©nam/©ART/©alb…): the 4-byte meaning code (0x01 = UTF-8 text), then
-     * a "data" sub-box whose type says "UTF-8 string" (0x01), then the bytes of the text.
+     * A text metadata atom (©nam/©ART/©alb…). Its body is a "data" sub-box whose own body is
+     * 4 type/flag bytes (1 = UTF-8 text), 4 locale bytes (0), then the UTF-8 bytes of the text —
+     * the exact layout iTunes/ffmpeg/mutagen/MediaStore all read.
      */
     private fun textAtom(name: String, text: String): ByteArray {
         val data = ByteArrayOutputStream()
-        writeUint32(data, 1) // meaning = text
-        writeUint32(data, 0x00000001) // type flags: UTF-8
+        writeUint32(data, 0x00000001) // data type: UTF-8 text
         writeUint32(data, 0) // locale
         data.write(text.toByteArray(Charsets.UTF_8))
         val payload = box("data", data.toByteArray())
-        return box("©$name", payload)
+        return taggedBox(name, payload)
     }
 
-    /** covr is itself a FullBox: 4 type bytes (13 = jpeg, 14 = png) then the image. */
+    /**
+     * The cover atom. Its body is a "data" sub-box whose own body is 4 type/flag bytes
+     * (13 = JPEG, 14 = PNG), 4 locale bytes (0), then the image bytes — the layout every MP4
+     * reader treats as embedded artwork.
+     */
     private fun coverAtom(cover: ByteArray): ByteArray {
-        val payload = ByteArrayOutputStream()
-        writeUint32(payload, if (isJpeg(cover)) 0x0D else 0x0E)
-        payload.write(cover)
-        return box("covr", payload.toByteArray())
+        val data = ByteArrayOutputStream()
+        writeUint32(data, if (isJpeg(cover)) 0x0000000D else 0x0000000E) // data type: JPEG/PNG
+        writeUint32(data, 0) // locale
+        data.write(cover)
+        return box("covr", box("data", data.toByteArray()))
     }
 
     private fun isJpeg(cover: ByteArray): Boolean =
@@ -139,6 +159,20 @@ object Mp4TagWriter {
     private fun box(type: String, payload: ByteArray): ByteArray {
         val out = ByteArrayOutputStream()
         writeUint32(out, 8 + payload.size)
+        out.write(type.toByteArray(Charsets.US_ASCII))
+        out.write(payload)
+        return out.toByteArray()
+    }
+
+    /**
+     * A metadata atom whose 4-byte name starts with the © byte (0xA9): the © is written as a raw
+     * byte — `"...".toByteArray(US_ASCII)` would turn it into '?' (0x3F) and no reader would
+     * recognize the atom. Name [type] here is the 3 chars after the ©.
+     */
+    private fun taggedBox(type: String, payload: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        writeUint32(out, 8 + payload.size)
+        out.write(0xA9) // ©
         out.write(type.toByteArray(Charsets.US_ASCII))
         out.write(payload)
         return out.toByteArray()

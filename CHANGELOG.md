@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.24
+- Fixed the bug where downloads kept showing "Unknown artist" / no album with a grey tile: the metadata atoms written into the m4a were malformed (the © byte was dropped to '?' by ASCII encoding, the text atoms had a 4-byte misalignment and the cover atom had no data sub-box), so no player — Android's scanner included — could read them. The atoms are now written exactly as iTunes/ffmpeg/mutagen expect them, verified byte-for-byte against those parsers: title, artist, album and cover all read back from a real downloaded file.
+- The MP3 fallback path was verified against the same parsers (its ID3v2.3 tag was already correct; title/artist/album/APIC cover all read back).
+
 ## 1.2.23
 - Downloads now carry the song's REAL album, not a placeholder: the album comes from SoundCloud's own release data (the label's album title, the release title, the label name, or the song title for a single), so a downloaded file is grouped under its actual album in every player.
 - m4a downloads embed the full metadata now: title, artist and ALBUM text atoms (©nam/©ART/©alb) are written next to the cover atom, and any title/artist the stream already carried is REPLACED instead of duplicated, so the file has exactly one of each.
