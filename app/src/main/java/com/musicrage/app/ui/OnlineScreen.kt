@@ -60,6 +60,7 @@ import com.musicrage.app.R
 import com.musicrage.app.data.ArtworkLoader
 import com.musicrage.app.data.OnlineApi
 import com.musicrage.app.data.OnlineVideo
+import com.musicrage.app.online.OnlineAdState
 import com.musicrage.app.online.OnlineLoading
 import com.musicrage.app.online.OnlinePlayer
 import com.musicrage.app.online.OnlineStore
@@ -395,6 +396,7 @@ private fun OnlineNowPlaying(video: OnlineVideo, playing: Boolean) {
     val duration = OnlinePlayer.durationSec
     val position = OnlinePlayer.positionSec
     val loading = OnlineLoading.active
+    val adShowing = OnlineAdState.showing
     val tint = rememberUrlTint(video.thumb)
     var drag by remember { mutableStateOf<Float?>(null) }
     val live = if (duration > 0.0) (position / duration).toFloat().coerceIn(0f, 1f) else 0f
@@ -420,7 +422,11 @@ private fun OnlineNowPlaying(video: OnlineVideo, playing: Boolean) {
                     Text(video.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        if (loading) "Loading…" else video.channel,
+                        when {
+                            adShowing -> "Ads — please wait"
+                            loading -> "Loading…"
+                            else -> video.channel
+                        },
                         color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
                 }

@@ -22,10 +22,9 @@ import java.net.URLEncoder
 import java.util.Locale
 
 /**
- * A song found on SoundCloud. [id] is the numeric track id, [permalink] its soundcloud.com path,
- * [duration] the track length in seconds, [playable] whether the widget can play it. Official
- * label uploads only offer AES-encrypted HLS — the widget plays those fine (it decrypts them
- * in-page), so they count as playable; only login-required Go+ exclusives do not.
+ * A song found on YouTube. [id] is the 11-character video id, [channel] the artist/uploading channel,
+ * [thumb] the cover thumbnail (i.ytimg.com), [permalink] the youtube.com/watch?v= page, [duration]
+ * the video length in seconds.
  */
 data class OnlineVideo(
     val id: String,
@@ -36,7 +35,7 @@ data class OnlineVideo(
     val duration: Double = 0.0,
     val playable: Boolean = true,
     val likes: Long = 0L,
-    /** The album the song belongs to, from SoundCloud's own release data (publisher album title, or the release/label name). */
+    /** The album the song belongs to (from the video title when YouTube exposes one). */
     val album: String = ""
 )
 
@@ -56,7 +55,7 @@ object OnlineApi {
             connection.setRequestProperty("User-Agent", BROWSER_AGENT)
             connection.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
         } else {
-            connection.setRequestProperty("User-Agent", "MusicRage/1.2")
+            connection.setRequestProperty("User-Agent", "MusicRage/1.3")
         }
         if (range != null) connection.setRequestProperty("Range", range)
         for ((name, value) in headers) connection.setRequestProperty(name, value)
@@ -111,487 +110,272 @@ object OnlineApi {
 
     private fun encode(value: String) = URLEncoder.encode(value, "UTF-8")
 
-    // ---- SoundCloud client_id ---------------------------------------------------------------------------------------------
+    // ---- YouTube search: mp3juice (primary) + Piped (fallback) ---------------------------------------------------------
 
-    /** Known working client ids; a fresh one is scraped from the widget bundle when these stop working. */
-    @Volatile
-    private var clientId: String = "nIjtjiYnjkOhMyh5xrbqEW12DxeJVnic"
+    private const val MP3JUICE_API_KEY = "mp3juice_c1ce77421b808bc5b89a307da142f3211313469053730109c30c3c4fc9abff3b"
+    private const val SITE = "https://mp3juice.sc"
+    private const val PIPED_API = "https://api.piped.private.coffee"
 
-    @Volatile
-    private var clientIdCheckedAt = 0L
-
-    private fun soundcloudGet(pathAndQuery: String): String {
-        val fresh = System.currentTimeMillis() - clientIdCheckedAt < 30_000L
-        try {
-            return get("https://api-v2.soundcloud.com$pathAndQuery" + (if (pathAndQuery.contains("?")) "&" else "?") + "client_id=$clientId", browser = true)
-        } catch (e: Exception) {
-            if (!fresh) throw e
-        }
-        refreshClientId()
-        return get("https://api-v2.soundcloud.com$pathAndQuery" + (if (pathAndQuery.contains("?")) "&" else "?") + "client_id=$clientId", browser = true)
+    /** The id part of a Piped "/watch?v=ID" url. */
+    private fun pipedId(url: String): String {
+        val m = Regex("[?&]v=([A-Za-z0-9_-]{11})").find(url)
+        return m?.groupValues?.get(1) ?: ""
     }
 
     /**
-     * Pulls a brand-new client_id from the SoundCloud widget's JavaScript bundle (the ids are rotated now and
-     * then). Called when the saved one starts failing.
-     */
-    private fun refreshClientId() {
-        synchronized(this) {
-            try {
-                val html = get("https://w.soundcloud.com/player/?url=https%3A//api.soundcloud.com/platforms/web", browser = true)
-                val bundles = Regex("https://widget\\.sndcdn\\.com/widget-[^\"]+\\.js").findAll(html).map { it.value }.toList()
-                for (bundle in bundles) {
-                    val body = get(bundle, browser = true)
-                    val found = Regex("client_id[a-z]?\\s*[:=]\\s*[\"']([A-Za-z0-9]{20,50})[\"']").find(body)?.groupValues?.get(1)
-                    if (found != null) {
-                        clientId = found
-                        clientIdCheckedAt = System.currentTimeMillis()
-                        return
-                    }
-                }
-            } catch (e: Exception) {
-                // keep the old id; the next call will try again
-            }
-        }
-    }
-
-    // ---- Search and track metadata ---------------------------------------------------------------------------------------
-
-    private fun fromTrack(t: JSONObject): OnlineVideo {
-        val artwork = t.optString("artwork_url").replace("-large", "-t200x200")
-        return OnlineVideo(
-            id = t.optLong("id").toString(),
-            title = t.optString("title"),
-            channel = t.optJSONObject("user")?.optString("username").orEmpty(),
-            thumb = artwork,
-            permalink = "https://soundcloud.com" + t.optString("permalink_uri", t.optString("permalink")),
-            // A preview-only track reports its preview length, not the full one.
-            duration = (t.optDouble("full_duration", 0.0).takeIf { it > 0 } ?: t.optDouble("duration", 0.0)) / 1000.0,
-            playable = hasPlayableTranscoding(t),
-            likes = t.optLong("likes_count", 0L),
-            // SoundCloud has no plain "album" field on a track; the real album name lives in the
-            // publisher/release metadata (label releases fill "album_title", indies fill "release"
-            // or name the release after the song). Fall back to the label, then the song title —
-            // a downloaded file should never end up with a made-up album like "Music Rage Downloads".
-            album = trackAlbum(t)
-        )
-    }
-
-    /** The album name of a track, resolved from every place SoundCloud keeps it. */
-    private fun trackAlbum(t: JSONObject): String {
-        val publisher = t.optJSONObject("publisher_metadata")
-        val fromPublisher = publisher?.optString("album_title").orEmpty()
-        if (fromPublisher.isNotBlank()) return fromPublisher.trim()
-        val fromPublisherRelease = publisher?.optString("release_title").orEmpty()
-        if (fromPublisherRelease.isNotBlank()) return fromPublisherRelease.trim()
-        val release = t.optString("release")
-        if (release.isNotBlank()) return release.trim()
-        val label = t.optString("label_name")
-        if (label.isNotBlank()) return label.trim()
-        val metadataArtist = t.optString("metadata_artist")
-        if (metadataArtist.isNotBlank()) return metadataArtist.trim()
-        // No release data at all: the song is a single — its title is the album, like a single
-        // on any other music platform, so the library groups it under its own name.
-        return t.optString("title").trim()
-    }
-
-    /**
-     * True when the track has a stream the widget can actually use. Label-provided tracks only offer
-     * AES-encrypted HLS; the widget decrypts those itself (SAMPLE-AES in-page), so they play fine and
-     * count as playable. What does NOT play without a SoundCloud login is a Go+ exclusive or a
-     * snipped preview.
-     */
-    private fun hasPlayableTranscoding(t: JSONObject): Boolean {
-        if (t.optBoolean("snipped", false)) return false
-        // SoundCloud's own flags (see the API docs: access is playable / preview / blocked, and the track
-        // policy says whether a full stream is allowed). Only a fully playable track counts.
-        val policy = t.optString("policy")
-        if (policy.equals("GO_PLUS", ignoreCase = true) || policy.equals("BLOCK", ignoreCase = true) ||
-            policy.equals("SNIP", ignoreCase = true)
-        ) return false
-        val access = t.optString("access")
-        if (access.equals("blocked", ignoreCase = true) || access.equals("preview", ignoreCase = true)) return false
-        if (t.optBoolean("streamable", true) == false) return false
-        val transcodings = t.optJSONObject("media")?.optJSONArray("transcodings") ?: return false
-        for (i in 0 until transcodings.length()) {
-            val transcoding = transcodings.optJSONObject(i) ?: continue
-            // A transcoding marked snipped is the 30-second preview, not the song.
-            if (transcoding.optBoolean("snipped", false)) continue
-            val protocol = transcoding.optJSONObject("format")?.optString("protocol").orEmpty()
-            if (protocol == "hls" || protocol == "progressive" ||
-                protocol == "cbc-encrypted-hls" || protocol == "ctr-encrypted-hls"
-            ) return true
-        }
-        return false
-    }
-
-    /**
-     * Orders results the way a person expects: the song whose title IS the query first (that is the
-     * "original/official" upload — covers add words like "cover", "sped up", "remix"), then songs from
-     * the artist the query names, then everything else by popularity. Official label uploads no longer
-     * sink below random covers.
-     */
-    private fun rankByRelevance(query: String, results: List<OnlineVideo>): List<OnlineVideo> {
-        val q = normalize(query)
-        val words = q.split(Regex("\\s+")).filter { it.length > 2 }
-        val coverMarkers = listOf(
-            "cover", "sped up", "remix", "reimagined", "extended", "live at", "demo", "version",
-            "instrumental", "acoustic", "karaoke", "edit", "nightcore", "slowed", "reverb", "2x"
-        )
-        fun score(v: OnlineVideo): Int {
-            val title = normalize(v.title)
-            val channel = normalize(v.channel)
-            var s = 0
-            if (title == q) s += 100
-            else if (title.startsWith(q)) s += 80
-            else if (title.contains(q)) s += 60
-            val lower = v.title.lowercase()
-            if (coverMarkers.any { lower.contains(it) }) s -= 45
-            if (channel.contains(q) && q.isNotEmpty()) s += 40
-            // "terenova cakes and eclairs": the artist named inside a longer query still counts.
-            else if (channel.length >= 3 && q.contains(channel)) s += 40
-            for (w in words) {
-                if (title.contains(w)) s += 10
-                if (channel.contains(w)) s += 5
-            }
-            // Popularity as the tie-breaker, scaled so it can decide between similar titles but
-            // never outrank an exact title match (likes up to ~50 act like one extra keyword hit).
-            s += (v.likes.coerceAtMost(50_000L) / 1_000L).toInt()
-            if (v.playable) s += 5
-            if (v.duration in 45.0..600.0) s += 5 else s -= 10
-            return s
-        }
-        return results.sortedByDescending { score(it) }
-    }
-
-    private fun normalize(s: String) =
-        s.lowercase().trim().replace(Regex("[\\p{Punct}]+"), " ").replace(Regex("\\s+"), " ")
-
-    /**
-     * Search SoundCloud for tracks, keeping everything the widget can play — including official
-     * label uploads with encrypted streams (the widget decrypts them itself).
-     *
-     * Beyond plain track results the query is also matched against artists and playlists, the way
-     * the SoundCloud site does: when a result playlist looks like it holds the song (its title
-     * matches the query), its tracks are expanded in; artist profiles in the results contribute
-     * their uploads. That is how "kalapastanganan" and artist-name searches surface the song
-     * itself instead of unrelated covers.
+     * Searches YouTube for songs. mp3juice's yt results are the primary source (fast, official),
+     * Piped's public search is the fallback when mp3juice does not answer. Titles are cleaned of the
+     * "Official Video / Lyric Video" noise so the list reads like a music app.
      */
     fun search(query: String, playableOnly: Boolean = true): List<OnlineVideo> {
         val text = query.trim()
         if (text.isEmpty()) return emptyList()
         val out = LinkedHashMap<String, OnlineVideo>()
-        // SoundCloud's search ANDs every word, so a full query like "terenova cakes and eclairs"
-        // can return zero results while shorter forms find the song. The query is tried as typed,
-        // then with filler words dropped, then with trailing words dropped, until something hits.
-        val attempts = searchLadder(text)
-        var collection: JSONArray = JSONArray()
-        for (attempt in attempts) {
-            val raw = soundcloudGet("/search?q=${encode(attempt)}&limit=25&variant=generic")
-            val items = JSONObject(raw).optJSONArray("collection") ?: JSONArray()
-            if (items.length() > 0) {
-                collection = items
-                break
+        // 1) mp3juice yt search
+        for (video in runCatching { mp3juiceSearch(text) }.getOrDefault(emptyList())) {
+            if (video.id.isNotEmpty() && video.id !in out) out[video.id] = video
+        }
+        // 2) Piped search — fills artist names, durations and covers mp3juice lacks
+        if (out.size < 5) {
+            for (video in runCatching { pipedSearch(text) }.getOrDefault(emptyList())) {
+                if (video.id.isNotEmpty() && video.id !in out) out[video.id] = video
             }
         }
-        val playlists = ArrayList<Long>()
-        val users = ArrayList<String>()
-        for (i in 0 until collection.length()) {
-            val item = collection.optJSONObject(i) ?: continue
-            when (item.optString("kind")) {
-                "track" -> {
-                    val video = fromTrack(item)
-                    if (video.id.isNotEmpty() && video.title.isNotBlank()) out[video.id] = video
-                }
-                "playlist", "system-playlist" -> playlists.add(item.optLong("id"))
-                "user" -> users.add(item.optLong("id").toString())
-            }
-        }
-        // The site shows people and playlists too. A playlist whose title matches the query very
-        // likely holds exactly the song that was searched for (people name playlists after songs).
-        for (id in playlists.take(6)) {
-            val expanded = runCatching { playlistTracks(id) }.getOrDefault(emptyList())
-            for (video in expanded) if (video.id !in out) out[video.id] = video
-        }
-        // An artist profile in the results means their uploads belong in the list as well.
-        for (id in users.take(3)) {
-            val tracks = runCatching { userTracks(id) }.getOrDefault(emptyList())
-            for (video in tracks) if (video.id !in out) out[video.id] = video
-        }
-        // The artist the query names ("terenova"): SoundCloud's site shows the profile first, so do the same.
-        for (video in runCatching { searchArtistTracks(text) }.getOrDefault(emptyList())) {
-            if (video.id !in out) out[video.id] = video
-        }
-        // Few track hits in the mixed list: ask the track-only search as well.
-        if (out.size < 8) {
-            for (attempt in attempts.take(3)) {
-                val raw = runCatching { soundcloudGet("/search/tracks?q=${encode(attempt)}&limit=30") }.getOrNull() ?: continue
-                val items = runCatching { JSONObject(raw).optJSONArray("collection") }.getOrNull() ?: continue
-                var added = 0
-                for (i in 0 until items.length()) {
-                    val item = items.optJSONObject(i) ?: continue
-                    val video = fromTrack(item)
-                    if (video.id.isNotEmpty() && video.title.isNotBlank() && video.id !in out) {
-                        out[video.id] = video
-                        added += 1
-                    }
-                }
-                if (added > 0) break
-            }
-        }
-        var results = out.values.toList()
-        if (playableOnly) {
-            val playable = results.filter { it.playable }
-            if (playable.isNotEmpty()) results = playable
-        }
+        val results = out.values.toList()
         return rankByRelevance(text, results)
     }
 
+    /** mp3juice's YouTube results: {count, ytCount, yt:[{id,title,duration}], sc…}. */
+    private fun mp3juiceSearch(text: String): List<OnlineVideo> {
+        val b64 = java.util.Base64.getEncoder().encodeToString(encode(text).toByteArray(Charsets.UTF_8))
+        val raw = get(
+            "$SITE/api/v1/search?api_key=${encode(MP3JUICE_API_KEY)}&y=y&q=$b64",
+            browser = true,
+            headers = mapOf("Origin" to SITE, "Referer" to "$SITE/", "Accept" to "application/json, text/plain, */*")
+        )
+        val items = JSONObject(raw).optJSONArray("yt") ?: JSONArray()
+        val out = ArrayList<OnlineVideo>()
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            val id = item.optString("id")
+            if (id.length != 11) continue
+            val title = item.optString("title").trim()
+            if (title.isBlank()) continue
+            out.add(OnlineVideo(
+                id = id,
+                title = cleanTitle(title),
+                // Channel is not in mp3juice's reply; oEmbed fills it when the video is played or downloaded.
+                channel = channelFromTitle(title),
+                thumb = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+                permalink = "https://www.youtube.com/watch?v=$id",
+                duration = parseDuration(item.optString("duration"))
+            ))
+        }
+        return out
+    }
+
+    /** Piped's public search: {items:[{url,title,uploaderName,duration,thumbnail}]}. */
+    private fun pipedSearch(text: String): List<OnlineVideo> {
+        val raw = get("$PIPED_API/search?q=${encode(text)}&filter=music_videos", browser = true)
+        val items = JSONObject(raw).optJSONArray("items") ?: JSONArray()
+        val out = ArrayList<OnlineVideo>()
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            val id = pipedId(item.optString("url"))
+            if (id.length != 11) continue
+            val title = item.optString("title").trim()
+            if (title.isBlank()) continue
+            val channel = item.optString("uploaderName").trim()
+            out.add(OnlineVideo(
+                id = id,
+                title = cleanTitle(title),
+                channel = if (channel.isBlank()) channelFromTitle(title) else stripTopic(channel),
+                thumb = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+                permalink = "https://www.youtube.com/watch?v=$id",
+                duration = item.optDouble("duration", 0.0)
+            ))
+        }
+        return out
+    }
+
+    /** "4:05" / "1:02:03" → seconds. */
+    private fun parseDuration(text: String): Double {
+        val parts = text.split(":").map { it.toIntOrNull() ?: 0 }
+        if (parts.isEmpty() || parts.any { it < 0 }) return 0.0
+        return when (parts.size) {
+            2 -> parts[0] * 60 + parts[1].toDouble()
+            3 -> parts[0] * 3600 + parts[1] * 60 + parts[2].toDouble()
+            else -> 0.0
+        }
+    }
+
     /**
-     * People whose name matches the query (SoundCloud's /search/users), with their most popular uploads.
-     * "terenova" returns the artist Terenova and her songs even when the mixed search buried the profile.
+     * "Multo - Cup of Joe (Official Lyric Video)" → "Cup of Joe": YouTube music titles are
+     * "Song - Artist" far more often than the reverse, and the artist is what metadata needs.
      */
-    private fun searchArtistTracks(text: String): List<OnlineVideo> {
-        val q = normalize(text)
-        val words = q.split(" ").filter { it.length >= 3 }
-        val queries = LinkedHashSet<String>()
-        queries.add(text)
-        words.firstOrNull()?.let { queries.add(it) }
-        val chosen = LinkedHashSet<String>()
-        for (query in queries) {
-            val raw = runCatching { soundcloudGet("/search/users?q=${encode(query)}&limit=6") }.getOrNull() ?: continue
-            val items = runCatching { JSONObject(raw).optJSONArray("collection") }.getOrNull() ?: continue
-            for (i in 0 until items.length()) {
-                val user = items.optJSONObject(i) ?: continue
-                val name = normalize(user.optString("username"))
-                val full = normalize(user.optString("full_name"))
-                val hit = name.length >= 3 && (
-                    q == name || q.contains(name) || name == words.firstOrNull() ||
-                        (words.isNotEmpty() && words.all { w -> name.contains(w) || full.contains(w) })
-                    )
-                if (hit) chosen.add(user.optLong("id").toString())
-            }
-        }
-        val out = ArrayList<OnlineVideo>()
-        for (id in chosen.take(2)) {
-            var tracks = runCatching { userTopTracks(id) }.getOrDefault(emptyList())
-            if (tracks.isEmpty()) tracks = runCatching { userTracks(id) }.getOrDefault(emptyList())
-            out.addAll(tracks)
-        }
-        return out
+    private fun channelFromTitle(rawTitle: String): String {
+        val title = rawTitle.trim()
+        val m = SITE_PREFIX.find(title)
+        val cleaned = (if (m != null) title.removeRange(m.range) else title).trim()
+        val dash = cleaned.split(Regex("\\s+[-–—]\\s+"))
+        return if (dash.size >= 2) dash[1].trim() else ""
     }
 
-    private fun userTopTracks(userId: String): List<OnlineVideo> {
-        val raw = soundcloudGet("/users/$userId/toptracks?limit=15")
-        val array = JSONObject(raw).optJSONArray("collection") ?: return emptyList()
-        val out = ArrayList<OnlineVideo>()
-        for (i in 0 until array.length()) {
-            val item = array.optJSONObject(i) ?: continue
-            val video = fromTrack(item)
-            if (video.id.isNotEmpty() && video.title.isNotBlank()) out.add(video)
-        }
-        return out
+    /** "- Topic" channels are YouTube's auto-generated artist channels; the real artist is the name before it. */
+    private fun stripTopic(channel: String): String =
+        channel.removeSuffix(" - Topic").removeSuffix("- Topic").trim()
+
+    /** Removes the bracket noise YouTube titles carry; keeps Ft/feat parts (they name real artists). */
+    private fun cleanTitle(title: String): String {
+        var t = title
+        for (noise in listOf(
+            Regex("""\((?:official\s+)?(?:music\s+)?(?:lyric[s]?\s+)?video\)""", RegexOption.IGNORE_CASE),
+            Regex("""\[official\s+(?:music\s+)?video\]""", RegexOption.IGNORE_CASE),
+            Regex("""\(official\s+audio\)""", RegexOption.IGNORE_CASE),
+            Regex("""\(lyric[s]?\s+video\)""", RegexOption.IGNORE_CASE),
+            Regex("""\(audio\s+only\)""", RegexOption.IGNORE_CASE)
+        )) t = t.replace(noise, "")
+        return t.replace(Regex("\\s+"), " ").trim()
     }
+
+    private val SITE_PREFIX = Regex("""^\s*[\w-]+(\.[\w-]+)*\.(com|net|org|io|cc|to|me|app|co|info|xyz)\s*[-–|:]\s*""", RegexOption.IGNORE_CASE)
+
+    /** Official uploads and exact matches first, covers/lyrics/8d versions after. */
+    private fun rankByRelevance(query: String, videos: List<OnlineVideo>): List<OnlineVideo> {
+        val words = query.lowercase(Locale.ROOT).split(Regex("\\s+")).filter { it.isNotBlank() }
+        return videos.sortedWith(compareByDescending<OnlineVideo> { v ->
+            val hay = (v.title + " " + v.channel).lowercase(Locale.ROOT)
+            words.count { hay.contains(it) }
+        }.thenByDescending { v -> v.duration in 90.0..500.0 }.thenBy { it.title.length })
+    }
+
+    // ---- Suggestions (auto-correct while typing) ------------------------------------------------------------------------
 
     /**
-     * Other uploads of the same song, best match first. Used when a song cannot play on this phone: instead of
-     * leaving a dead play button, the app quietly plays another playable version (the artist's own re-upload,
-     * a lyric video, etc.).
-     */
-    fun alternatives(video: OnlineVideo, avoid: Set<String>): List<OnlineVideo> {
-        val noise = setOf("official", "audio", "lyrics", "lyric", "video", "music", "hd", "hq", "feat", "ft")
-        val words = normalize(video.title).split(" ").filter { it.length > 2 && it !in noise }
-        if (words.isEmpty()) return emptyList()
-        val found = LinkedHashMap<String, OnlineVideo>()
-        for (query in listOf("${video.title} ${video.channel}", video.title)) {
-            for (candidate in runCatching { search(query) }.getOrDefault(emptyList())) {
-                found.putIfAbsent(candidate.id, candidate)
-            }
-        }
-        return found.values.filter { candidate ->
-            val title = normalize(candidate.title)
-            candidate.playable && candidate.id != video.id && candidate.id !in avoid &&
-                words.count { title.contains(it) } >= Math.ceil(words.size * 0.6).toInt()
-        }
-    }
-
-    /** The query as typed, then filler words dropped, then trailing words dropped. */
-    private fun searchLadder(query: String): List<String> {
-        val words = query.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val attempts = LinkedHashSet<String>()
-        attempts.add(query)
-        val filler = setOf("and", "the", "by", "of", "a", "an", "feat", "ft", "x", "official", "video", "music", "audio")
-        // Drop filler words first ("cakes and eclairs" -> "cakes eclairs").
-        var cur = words.toMutableList()
-        for (i in words.indices.reversed()) {
-            if (words[i].lowercase(Locale.ROOT) in filler && cur.size > 1) {
-                cur.removeAt(i)
-                attempts.add(cur.joinToString(" "))
-            }
-        }
-        // Then drop trailing words one at a time ("terenova cakes eclairs" -> "terenova cakes" -> "terenova").
-        cur = words.toMutableList()
-        while (cur.size > 1) {
-            cur.removeAt(cur.size - 1)
-            attempts.add(cur.joinToString(" "))
-        }
-        return attempts.toList()
-    }
-
-    /** The tracks inside a playlist. */
-    private fun playlistTracks(playlistId: Long): List<OnlineVideo> {
-        val raw = soundcloudGet("/playlists/$playlistId")
-        val array = JSONObject(raw).optJSONArray("tracks") ?: return emptyList()
-        val out = ArrayList<OnlineVideo>()
-        for (i in 0 until array.length()) {
-            val item = array.optJSONObject(i) ?: continue
-            val video = fromTrack(item)
-            if (video.id.isNotEmpty() && video.title.isNotBlank()) out.add(video)
-        }
-        return out
-    }
-
-    /** The uploads of one artist profile. */
-    private fun userTracks(userId: String): List<OnlineVideo> {
-        val raw = soundcloudGet("/users/$userId/tracks?limit=15")
-        val array = JSONObject(raw).optJSONArray("collection") ?: return emptyList()
-        val out = ArrayList<OnlineVideo>()
-        for (i in 0 until array.length()) {
-            val item = array.optJSONObject(i) ?: continue
-            val video = fromTrack(item)
-            if (video.id.isNotEmpty() && video.title.isNotBlank()) out.add(video)
-        }
-        return out
-    }
-
-    /**
-     * Suggestions while typing: SoundCloud's own query-completion endpoint ("kalapa" suggests
-     * "kalapastanganan", "ako ang b" suggests "ako ang bagyo"). Returning the completed queries
-     * rather than track titles is what makes a half-typed word auto-correct to the real song name.
+     * Suggestions while typing: YouTube's own completion endpoint (the same one youtube.com's search
+     * box uses). "multo cup of" suggests "multo cup of joe" — a half-typed word auto-corrects to the
+     * real song name.
      */
     fun suggest(query: String): List<String> {
         val text = query.trim()
         if (text.length < 2) return emptyList()
         val raw = runCatching {
-            soundcloudGet("/search/queries?q=${encode(text)}")
+            get("https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&xhr=t&q=${encode(text)}", browser = true)
         }.getOrNull() ?: return emptyList()
-        val array = runCatching { JSONObject(raw).optJSONArray("collection") }.getOrNull() ?: return emptyList()
-        val out = LinkedHashSet<String>()
-        for (i in 0 until array.length()) {
-            val item = array.optJSONObject(i) ?: continue
-            val completed = item.optString("query").ifBlank { item.optString("output") }
-            if (completed.isBlank()) continue
-            // Only completions that actually extend what was typed; a suggestion equal to the
-            // input is pointless.
-            if (completed.equals(text, ignoreCase = true)) continue
-            out.add(completed)
+        // The reply is JSON-ish: ["multo cup of",[["multo cup of joe",0,[512]],...]]
+        val suggestions = LinkedHashSet<String>()
+        val array = runCatching { JSONArray(raw).optJSONArray(1) }.getOrNull()
+        if (array != null) {
+            for (i in 0 until array.length()) {
+                val entry = array.optJSONArray(i) ?: continue
+                val completed = entry.optString(0).trim()
+                if (completed.isBlank() || completed.equals(text, ignoreCase = true)) continue
+                suggestions.add(completed)
+            }
         }
-        return out.toList().take(6)
+        if (suggestions.isEmpty()) {
+            // Some replies wrap the data differently (window.google.suggest.p...); catch plain pairs.
+            for (m in Regex("\\[\"([^\"]{2,60})\",0").findAll(raw)) {
+                val completed = m.groupValues[1].trim()
+                if (!completed.equals(text, ignoreCase = true)) suggestions.add(completed)
+            }
+        }
+        return suggestions.toList().take(6)
     }
 
-    fun recommended(): List<OnlineVideo> = search("popular music")
+    fun recommended(): List<OnlineVideo> = search("OPM love songs")
 
-    /** One track by id, refreshed from SoundCloud (used to fill in permalink/duration). */
+    /** One video's metadata, refreshed through oEmbed (title + artist + thumbnail). */
     fun track(id: String): OnlineVideo? {
-        val raw = soundcloudGet("/tracks/$id")
-        return runCatching { fromTrack(JSONObject(raw)) }.getOrNull()
+        val oembed = oembed(id) ?: return null
+        return OnlineVideo(
+            id = id,
+            title = cleanTitle(oembed.first),
+            channel = oembed.second,
+            thumb = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+            permalink = "https://www.youtube.com/watch?v=$id",
+            album = albumFrom(oembed.first, oembed.second)
+        )
+    }
+
+    /** oEmbed gives (title, author) for a video id; both are what the file metadata needs. */
+    private fun oembed(id: String): Pair<String, String>? {
+        val raw = runCatching {
+            get("https://www.youtube.com/oembed?url=${encode("https://www.youtube.com/watch?v=$id")}&format=json", browser = true)
+        }.getOrNull() ?: return null
+        val obj = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+        val title = obj.optString("title").trim()
+        if (title.isBlank()) return null
+        return title to obj.optString("author_name").trim()
     }
 
     /**
-     * Songs SoundCloud itself considers similar to this one (the same endpoint the site's related
-     * tracks use). Used for auto-continue: after a song ends the next one comes from here, so the
-     * Online tab keeps playing music like the song that was just heard.
+     * The album for a YouTube song: music videos rarely state one, so a title marker like
+     * "Multo (from 'Silakbo')" wins when present. Otherwise the song title stands in — a downloaded
+     * file must never carry a made-up album name.
      */
-    fun related(trackId: String): List<OnlineVideo> {
-        val raw = soundcloudGet("/tracks/$trackId/related?limit=10")
-        val array = runCatching { JSONObject(raw).optJSONArray("collection") }.getOrNull() ?: return emptyList()
-        val out = ArrayList<OnlineVideo>()
-        for (i in 0 until array.length()) {
-            val item = array.optJSONObject(i) ?: continue
-            val video = fromTrack(item)
-            if (video.id.isNotEmpty() && video.title.isNotBlank()) out.add(video)
-        }
-        return out
+    private fun albumFrom(title: String, artist: String): String {
+        val fromMarker = Regex("""[(\["'](?:from|in|album[:\s])\s*['"']?([^)\]"']{2,60})""", RegexOption.IGNORE_CASE)
+            .find(title)?.groupValues?.get(1)?.trim()
+        if (!fromMarker.isNullOrEmpty()) return fromMarker
+        return cleanTitle(title)
     }
+
+    // ---- Related / similar songs (auto-next) ----------------------------------------------------------------------------
 
     /**
-     * The HLS playlist URL of a track: resolve the transcoding endpoint, then the media CDN URL.
-     * Both steps use the public client_id. Returns null when the track is not streamable.
+     * Songs similar to this one. Piped's related endpoint is unreliable, so similar songs are
+     * searched directly: the artist's other songs plus songs sharing the title. This is what
+     * auto-next picks from after a song ends.
      */
-    fun hlsPlaylist(trackId: String): String? {
-        val raw = soundcloudGet("/tracks/$trackId")
-        val track = JSONObject(raw)
-        if (track.optBoolean("snipped", false)) return null
-        val transcodings = track.optJSONObject("media")?.optJSONArray("transcodings") ?: return null
-        // Prefer the "sq" aac HLS rendition (160 kbps); fall back to any non-abr HLS.
-        var best: JSONObject? = null
-        for (i in 0 until transcodings.length()) {
-            val tc = transcodings.optJSONObject(i) ?: continue
-            if (tc.optJSONObject("format")?.optString("protocol") != "hls") continue
-            if (tc.optJSONObject("format")?.optString("mime_type")?.contains("mpegurl") == true) continue
-            if (tc.optString("quality") == "sq") best = tc
-            if (best == null) best = tc
+    fun related(video: OnlineVideo): List<OnlineVideo> {
+        val out = LinkedHashMap<String, OnlineVideo>()
+        // 1) The artist's other songs.
+        if (video.channel.isNotBlank()) {
+            for (v in runCatching { search("${video.channel} songs") }.getOrDefault(emptyList())) {
+                if (v.id != video.id) out[v.id] = v
+            }
         }
-        if (best == null) return null
-        val resolved = JSONObject(get(best.optString("url") + "?client_id=$clientId", browser = true))
-        return resolved.optString("url").takeIf { it.isNotBlank() }
+        // 2) Songs whose title matches (covers, versions, the same song on other channels).
+        for (v in runCatching { search(songTitle(video)) }.getOrDefault(emptyList())) {
+            if (v.id != video.id) out[v.id] = v
+        }
+        // 3) The genre the song belongs to, when nothing else came up.
+        if (out.isEmpty() && video.channel.isNotBlank()) {
+            for (v in runCatching { search("${video.channel} similar songs") }.getOrDefault(emptyList())) {
+                if (v.id != video.id) out[v.id] = v
+            }
+        }
+        return out.values.toList().take(12)
     }
 
-    // ---- HLS download (native SoundCloud, no converter) ---------------------------------------------------------------
-
-    /**
-     * Downloads a track by fetching its HLS segments (init.mp4 + media .m4s chunks) and joining them into
-     * a single playable MP4 stream. Works with plain HTTP and needs no converter service. Returns null
-     * when the track has no usable HLS rendition (or it cannot be fetched).
-     */
-    fun downloadHlsAudio(context: Context, video: OnlineVideo, progress: (Int) -> Unit): DownloadedAudio? {
-        val playlist = hlsPlaylist(video.id) ?: return null
-        progress(10)
-        val body = get(playlist, browser = true)
-        progress(20)
-        // An AES-encrypted playlist cannot be joined into a playable file by the app (the widget
-        // decrypts it in-page for playback, but a saved file must be unencrypted). Hand it to the
-        // converter instead.
-        if (body.contains("#EXT-X-KEY:METHOD=")) return null
-        val initUrl = Regex("#EXT-X-MAP:URI=\"([^\"]+)\"").find(body)?.groupValues?.get(1)
-        val segments = body.split("\n").map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
-        if (segments.isEmpty()) return null
-        // The true length of the audio, from the playlist itself — NOT the track metadata, which for
-        // preview tracks claims far more than the audio actually holds.
-        val seconds = Regex("#EXTINF:([\\d.]+)").findAll(body).map { it.groupValues[1].toDouble() }.sum()
-        val out = ByteArrayOutputStream()
-        // The init segment carries the MP4 headers; without it the file will not decode.
-        if (initUrl != null) {
-            val init = getBytes(initUrl) ?: return null
-            out.write(init)
-        }
-        val total = segments.size
-        for ((index, segment) in segments.withIndex()) {
-            val bytes = getBytes(segment) ?: return null
-            out.write(bytes)
-            progress(20 + (70 * (index + 1) / total))
-        }
-        progress(90)
-        val audio = out.toByteArray()
-        if (audio.size < 20_000) return null
-        return DownloadedAudio(audio, seconds)
+    /** The song name without the artist ("Multo - Cup of Joe" → "Multo"). */
+    private fun songTitle(video: OnlineVideo): String {
+        val dash = video.title.split(Regex("\\s+[-–—]\\s+"))
+        return dash.first().trim().ifBlank { video.title }
     }
 
-    /** What a native download produced: the audio bytes plus the length the playlist really holds. */
-    class DownloadedAudio(val bytes: ByteArray, val seconds: Double)
+    /** Alternative uploads of the same song (for when the chosen one refuses to play). */
+    fun alternatives(video: OnlineVideo, avoid: Set<String>): List<OnlineVideo> =
+        related(video).filter { it.id !in avoid }
 
     // ---- Cover art -------------------------------------------------------------------------------------------------------
 
-    /** The best-resolution cover art of a track, downloaded (embedded into saved files). */
+    /** The best-resolution cover art of a video, downloaded (embedded into saved files). */
     fun coverArt(video: OnlineVideo): ByteArray? {
         if (video.thumb.isBlank()) return null
-        val url = video.thumb.replace("-t200x200", "-t500x500").replace("-large", "-t500x500")
+        val url = video.thumb.replace("hqdefault.jpg", "maxresdefault.jpg")
         val bytes = getBytes(url) ?: getBytes(video.thumb) ?: return null
         if (bytes.size < 200) return null
+        if (bytes[0] != 0xFF.toByte() || bytes[1] != 0xD8.toByte()) {
+            // not a JPEG (404 pages come back as HTML) — fall back to the small one
+            val small = getBytes(video.thumb) ?: return null
+            return if (small.size > 200) small else null
+        }
         return bytes
     }
 
-    // ---- File saves ---------------------------------------------------------------
+    // ---- File saves -------------------------------------------------------------------
 
     /** File-system safe name used for the downloaded song (also how a repeat download is recognised). */
     fun safeName(video: OnlineVideo): String =
@@ -604,7 +388,7 @@ object OnlineApi {
             MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
             arrayOf(MediaStore.Audio.Media._ID),
             "${MediaStore.Audio.Media.DISPLAY_NAME} IN (?, ?) AND ${MediaStore.Audio.Media.RELATIVE_PATH} LIKE ?",
-            arrayOf("$name.m4a", "$name.mp3", "Music/Music Rage%"),
+            arrayOf("$name.mp3", "$name.m4a", "Music/Music Rage%"),
             null
         )?.use { it.count > 0 } ?: false
     }.getOrDefault(false)
@@ -614,37 +398,38 @@ object OnlineApi {
         private set
 
     /**
-     * Saves an m4a download. "moov.udta.meta.ilst" atoms with the track's title, artist, ALBUM and
-     * cover art are inserted into the MP4 (see [Mp4TagWriter]), so the file carries its real
-     * metadata — the library (and every other player) shows the song's own album, not a made-up one.
+     * Saves the MP3 the converter produced. The ID3 tag (title, artist, real album, embedded APIC
+     * cover) is written by [Id3Writer], so the file is complete the moment it lands — a real MP3
+     * with real metadata, not an m4a and not "Unknown artist".
      */
-    fun saveM4a(context: Context, bytes: ByteArray, video: OnlineVideo, seconds: Double, cover: ByteArray?) {
+    fun saveMp3(context: Context, url: String, video: OnlineVideo, cover: ByteArray?) {
         val safe = safeName(video)
         val album = video.album.ifBlank { safe }
         val resolver = context.contentResolver
         val values = ContentValues().apply {
-            put(MediaStore.Audio.Media.DISPLAY_NAME, "$safe.m4a")
+            put(MediaStore.Audio.Media.DISPLAY_NAME, "$safe.mp3")
             put(MediaStore.Audio.Media.TITLE, safe)
             put(MediaStore.Audio.Media.ARTIST, video.channel)
             put(MediaStore.Audio.Media.ALBUM, album)
-            put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+            put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
             put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/Music Rage")
             put(MediaStore.Audio.Media.IS_PENDING, 1)
             put(MediaStore.Audio.Media.IS_MUSIC, 1)
-            // The length the HLS playlist really holds, not the track's advertised one (which can be a
-            // preview length or an over-estimate); the media scanner corrects it after the save anyway.
-            if (seconds > 0) put(MediaStore.Audio.Media.DURATION, (seconds * 1000).toLong())
+            if (video.duration > 0) put(MediaStore.Audio.Media.DURATION, (video.duration * 1000).toLong())
         }
         val target = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
             ?: throw ApiException("Save failed: could not create the file")
         try {
-            val payload = runCatching {
-                Mp4TagWriter.withMetadata(bytes, safe, video.channel, album, cover)
-            }.getOrDefault(bytes)
-            resolver.openOutputStream(target)?.use { it.write(payload) }
+            val bytes = downloadBytesWithProgress(url)
+            val out = bytes ?: throw ApiException("Download failed: nothing was received")
+            val tagged = runCatching {
+                val tag = Id3Writer.buildTag(safe, video.channel, album, cover)
+                if (tag != null) Id3Writer.prependTag(out, tag) else out
+            }.getOrDefault(out)
+            resolver.openOutputStream(target)?.use { it.write(tagged) }
                 ?: throw ApiException("Save failed: could not write the file")
             values.clear()
-            putDone(values)
+            values.put(MediaStore.Audio.Media.IS_PENDING, 0)
             resolver.update(target, values, null, null)
         } catch (e: Exception) {
             runCatching { resolver.delete(target, null, null) }
@@ -652,18 +437,14 @@ object OnlineApi {
         }
     }
 
-    private fun putDone(values: ContentValues) {
-        values.put(MediaStore.Audio.Media.IS_PENDING, 0)
-    }
-
-    // ---- Download orchestration --------------------------------------------------------------
+    // ---- Download orchestration ------------------------------------------------------------
 
     /** The song whose download is running right now (drives the button label). */
     var preparingId: String? by mutableStateOf(null)
         private set
 
     /** Progress of the running download, 0..100. -1 while only "preparing" (no percentage yet). */
-    var downloadProgress: Int by mutableStateOf(-1)
+    var downloadProgress: Int by mutableIntStateOf(-1)
         private set
 
     private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -678,9 +459,10 @@ object OnlineApi {
     }
 
     /**
-     * Starts a download that keeps going even if the person leaves the Online tab. The audio is pulled
-     * straight from SoundCloud's CDN (HLS segments joined into one file) with the cover art embedded;
-     * if that is impossible the old converter is tried with the track's SoundCloud page.
+     * Starts a download that keeps going even if the person leaves the Online tab. The video is
+     * converted to MP3 by the mp3juice/thetacloud converter, and the file is saved with its full
+     * ID3 metadata (title, artist, album) and the embedded cover art. When the converter cannot
+     * handle the video a clear error message is shown.
      */
     fun startDownload(context: Context, video: OnlineVideo) {
         if (preparingId != null) {
@@ -696,22 +478,14 @@ object OnlineApi {
         say(context, "Preparing download…")
         downloadScope.launch {
             try {
-                val native = downloadHlsAudio(context, video) { setProgress(it) }
-                val cover = runCatching { coverArt(video) }.getOrNull()
-                if (native != null && native.bytes.size > 20_000) {
-                    say(context, "Downloading…")
-                    saveM4a(context, native.bytes, video, native.seconds, cover)
-                    setProgress(100)
-                    say(context, "Saved to Music/Music Rage")
-                } else {
-                    // Native HLS failed (encrypted-only track, preview, restricted): try the converter
-                    // with the track's SoundCloud page.
-                    val link = prepareMp3(video.permalink.ifEmpty { "https://soundcloud.com" })
-                    say(context, "Downloading…")
-                    saveMp3(context, link, video, cover)
-                    setProgress(100)
-                    say(context, "Saved to Music/Music Rage")
-                }
+                // Fill artist/album when the search list did not have them (mp3juice gives id+title only).
+                val full = enrich(video)
+                val cover = runCatching { coverArt(full) }.getOrNull()
+                val link = prepareMp3(full.permalink.ifEmpty { "https://www.youtube.com/watch?v=${full.id}" })
+                say(context, "Downloading…")
+                saveMp3(context, link, full, cover)
+                setProgress(100)
+                say(context, "Saved to Music/Music Rage")
             } catch (e: Exception) {
                 say(context, e.message?.takeIf { it.isNotBlank() } ?: "Download failed")
             } finally {
@@ -724,11 +498,17 @@ object OnlineApi {
         }
     }
 
-    // ---- Legacy converter (mp3juice / thetacloud) kept as the fallback ----------------------------------------------
+    /** A video from the search list, with artist/album filled in from oEmbed. */
+    private fun enrich(video: OnlineVideo): OnlineVideo {
+        if (video.channel.isNotBlank() && video.album.isNotBlank()) return video
+        val meta = runCatching { oembed(video.id) }.getOrNull() ?: return video
+        val artist = video.channel.ifBlank { meta.second }
+        return video.copy(channel = artist, album = albumFrom(meta.first, meta.second))
+    }
 
-    private const val MP3JUICE_API_KEY = "mp3juice_c1ce77421b808bc5b89a307da142f3211313469053730109c30c3c4fc9abff3b"
+    // ---- Converter (mp3juice / thetacloud): YouTube video → MP3 -------------------------------------------------------
+
     private const val CONVERT_HOST = "https://theta.thetacloud.org/api/v1"
-    private const val SITE = "https://mp3juice.sc"
 
     private fun siteHeaders(bearer: String? = null): Map<String, String> {
         val map = LinkedHashMap<String, String>()
@@ -832,49 +612,7 @@ object OnlineApi {
         return if (downloadUrl.contains("v=")) downloadUrl else joinQuery(downloadUrl, "v=$id&f=mp3&r=mp3juice.sc")
     }
 
-    /**
-     * Streams the MP3, embeds its metadata and cover art, and saves it into Music/Music Rage.
-     * The ID3 tag (title, artist, real album, embedded APIC cover) is written by [Id3Writer], so
-     * the file is complete the moment it lands — no grey tiles, no "Unknown artist", and the album
-     * is the song's own album instead of a made-up one.
-     */
-    fun saveMp3(context: Context, url: String, video: OnlineVideo, cover: ByteArray?) {
-        val safe = safeName(video)
-        val album = video.album.ifBlank { safe }
-        val resolver = context.contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.Audio.Media.DISPLAY_NAME, "$safe.mp3")
-            put(MediaStore.Audio.Media.TITLE, safe)
-            put(MediaStore.Audio.Media.ARTIST, video.channel)
-            put(MediaStore.Audio.Media.ALBUM, album)
-            put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
-            put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/Music Rage")
-            put(MediaStore.Audio.Media.IS_PENDING, 1)
-            put(MediaStore.Audio.Media.IS_MUSIC, 1)
-            // No DURATION here: the converter's file is whatever length it actually is, and the
-            // media scanner fills the true value in once the file is complete.
-        }
-        val target = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
-            ?: throw ApiException("Save failed: could not create the file")
-        try {
-            val bytes = downloadBytesWithProgress(url)
-            val out = bytes ?: throw ApiException("Download failed: nothing was received")
-            val tagged = runCatching {
-                val tag = Id3Writer.buildTag(safe, video.channel, album, cover)
-                if (tag != null) Id3Writer.prependTag(out, tag) else out
-            }.getOrDefault(out)
-            resolver.openOutputStream(target)?.use { it.write(tagged) }
-                ?: throw ApiException("Save failed: could not write the file")
-            values.clear()
-            values.put(MediaStore.Audio.Media.IS_PENDING, 0)
-            resolver.update(target, values, null, null)
-        } catch (e: Exception) {
-            runCatching { resolver.delete(target, null, null) }
-            throw e
-        }
-    }
-
-    /** Plain byte download with progress; used for the converter MP3 fallback. */
+    /** Plain byte download with progress; used for the converter MP3. */
     private fun downloadBytesWithProgress(url: String): ByteArray? {
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = 15_000

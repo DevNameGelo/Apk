@@ -14,6 +14,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
@@ -38,10 +39,11 @@ import java.io.ByteArrayInputStream
  * background (the foreground service keeps the process alive).
  */
 class BackgroundWebView(context: Context) : WebView(context) {
-    /** While parked the view is invisible and must not swallow touches meant for the app underneath. */
+    /** True while the view lives in the app-owned background overlay window (invisible, touch-through). */
     var passThrough = false
 
     override fun onWindowVisibilityChanged(visibility: Int) {
+        // Always report visible so an invisible player is never auto-paused.
         super.onWindowVisibilityChanged(View.VISIBLE)
     }
 
@@ -49,22 +51,31 @@ class BackgroundWebView(context: Context) : WebView(context) {
         if (passThrough) false else super.dispatchTouchEvent(event)
 }
 
-@Immutable
 data class OnlineState(
     val video: OnlineVideo? = null,
     val isPlaying: Boolean = false,
     val hasPrev: Boolean = false,
-    val hasNext: Boolean = false
+    val hasNext: Boolean = true
 )
 
 /**
  * The loading overlay state for the Online tab: true from the moment a video is requested until the
- * page reports it is actually playing. Null when nothing is loading.
+ * page reports it is actually playing.
  */
 object OnlineLoading {
     var active by mutableStateOf(false)
-        internal set
+    internal set
 }
+
+/**
+ * True while an ad is playing in the embedded player. The Online tab shows its
+ * "Ads — please wait" chip from this, and nothing else: when no ad runs the chip is gone.
+ */
+object OnlineAdState {
+    var showing by mutableStateOf(false)
+    internal set
+}
+
 /** Saved online-player state, used for "Continue playing" and for recovery after the app is killed. */
 object OnlineStore {
     private const val KEY_LAST = "online_last"
@@ -90,8 +101,8 @@ object OnlineStore {
         obj.optString("channel"),
         obj.optString("thumb"),
         obj.optString("permalink"),
-        // Entries saved by 1.2.17 have no "duration"; the no-fallback optDouble would hand back NaN
-        // and blow up the very next save. Anything unreadable counts as "unknown" (0), not NaN.
+        // Entries saved by older builds have no "duration"; the no-fallback optDouble would hand
+        // back NaN and blow up the very next save. Anything unreadable counts as "unknown" (0), not NaN.
         obj.optDouble("duration", 0.0).takeUnless { it.isNaN() } ?: 0.0,
         obj.optBoolean("playable", true),
         obj.optLong("likes", 0L),
@@ -109,99 +120,85 @@ object OnlineStore {
 
     /** Removes the "continue playing" pointer so a stopped player cannot be resurrected by mistake. */
     fun clearLast(context: Context) {
-        prefs(context).edit().remove(KEY_LAST).remove(KEY_POSITION).apply()
+        prefs(context).edit().remove(KEY_LAST).remove(KEY_POSITION).putBoolean(KEY_ALIVE, false).apply()
     }
 
     fun loadLast(context: Context): Pair<OnlineVideo, Double>? {
         val raw = prefs(context).getString(KEY_LAST, null) ?: return null
-        val video = runCatching { fromJson(JSONObject(raw)) }.getOrNull() ?: return null
-        if (video.id.isEmpty()) return null
-        return video to prefs(context).getFloat(KEY_POSITION, 0f).toDouble()
+        val position = prefs(context).getFloat(KEY_POSITION, 0f).toDouble()
+        return runCatching { fromJson(JSONObject(raw)) to position }.getOrNull()
     }
 
     fun history(context: Context): List<OnlineVideo> {
         val raw = prefs(context).getString(KEY_HISTORY, null) ?: return emptyList()
         return runCatching {
             val array = JSONArray(raw)
-            buildList<OnlineVideo> { for (i in 0 until array.length()) add(fromJson(array.getJSONObject(i))) }
+            (0 until array.length()).mapNotNull { i ->
+                array.optJSONObject(i)?.let { fromJson(it) }
+            }
         }.getOrDefault(emptyList())
-            // Placeholder entries from older builds ("Playing next") are dropped; one entry per video.
-            .filter { it.title != "Playing next" && it.id.isNotEmpty() }
-            .distinctBy { it.id }
     }
 
-    /** Removes a song from "Continue playing". Playing it again adds it back. */
     fun removeHistory(context: Context, id: String) {
-        val array = JSONArray()
-        history(context).filter { it.id != id }.forEach { array.put(toJson(it)) }
-        prefs(context).edit().putString(KEY_HISTORY, array.toString()).apply()
+        val kept = history(context).filter { it.id != id }
+        prefs(context).edit().putString(KEY_HISTORY, JSONArray().apply { kept.forEach { put(toJson(it)) } }.toString()).apply()
     }
 
     fun addHistory(context: Context, video: OnlineVideo) {
-        val updated = (listOf(video) + history(context).filter { it.id != video.id }).take(15)
-        val array = JSONArray()
-        updated.forEach { array.put(toJson(it)) }
-        prefs(context).edit().putString(KEY_HISTORY, array.toString()).apply()
+        val list = (history(context).filter { it.id != video.id } + video).takeLast(60)
+        prefs(context).edit().putString(KEY_HISTORY, JSONArray().apply { list.forEach { put(toJson(it)) } }.toString()).apply()
     }
 
     fun isAlive(context: Context) = prefs(context).getBoolean(KEY_ALIVE, false)
+
     fun setAlive(context: Context, alive: Boolean) {
         prefs(context).edit().putBoolean(KEY_ALIVE, alive).apply()
     }
 
+    /** The moment the app last saw the player alive; recovery uses this after a process kill. */
     fun beat(context: Context) {
         prefs(context).edit().putLong(KEY_BEAT, System.currentTimeMillis()).apply()
     }
 
-    fun beatAgeMs(context: Context): Long {
-        val last = prefs(context).getLong(KEY_BEAT, 0L)
-        return if (last == 0L) Long.MAX_VALUE else System.currentTimeMillis() - last
-    }
+    fun beatAgeMs(context: Context): Long =
+        System.currentTimeMillis() - prefs(context).getLong(KEY_BEAT, 0L)
+
+    // ---- Self-healing state (blocked ids, listening taste, dead ids, log) ------------------------------------------
 
     private const val KEY_BLOCKED = "online_blocked"
     private const val KEY_TASTE = "online_taste"
     private const val KEY_DEAD = "online_dead"
     private const val KEY_LOG = "online_log"
-    private const val KEY_SEEN = "online_seen"
+    private const val KEY_SEEN = "online_seen_v3"
 
     /**
-     * First run on this install: start from a clean slate so no stale marker from an earlier build can
-     * misfire (a phantom "alive" flag, a half-saved last video). Existing users are left untouched.
+     * Runs once per install: drops the SoundCloud-era saved state. SoundCloud track ids are pure
+     * numbers and can never play in the YouTube player, so they are removed from history, taste
+     * and the "continue playing" pointer (a blank slate, not a crash on the first tap).
      */
     fun onboard(context: Context) {
         val p = prefs(context)
         if (p.getBoolean(KEY_SEEN, false)) return
-        val existing = history(context).isNotEmpty()
-        val edit = p.edit().putBoolean(KEY_SEEN, true)
-        if (!existing) edit.remove(KEY_BLOCKED).remove(KEY_LAST).remove(KEY_POSITION).putBoolean(KEY_ALIVE, false)
-        edit.apply()
-        migrateToSoundcloud(context)
-    }
-
-    /**
-     * The switch to SoundCloud: ids that are not SoundCloud track numbers (old YouTube ids, placeholders)
-     * can never play again, so they are dropped from history, taste and the "continue playing" pointer.
-     */
-    private fun migrateToSoundcloud(context: Context) {
-        val p = prefs(context)
         val numeric = Regex("\\d{6,20}")
+        val edit = p.edit().putBoolean(KEY_SEEN, true)
         val oldHistory = history(context)
-        if (oldHistory.isNotEmpty() && oldHistory.any { !numeric.matches(it.id) }) {
-            val kept = oldHistory.filter { numeric.matches(it.id) }
+        if (oldHistory.isNotEmpty() && oldHistory.any { numeric.matches(it.id) }) {
+            val kept = oldHistory.filter { !numeric.matches(it.id) }
             val array = JSONArray()
             kept.forEach { array.put(toJson(it)) }
-            p.edit().putString(KEY_HISTORY, array.toString()).apply()
+            edit.putString(KEY_HISTORY, array.toString())
         }
         val last = loadLast(context)
-        if (last != null && !numeric.matches(last.first.id)) {
-            p.edit().remove(KEY_LAST).remove(KEY_POSITION).putBoolean(KEY_ALIVE, false).apply()
+        if (last != null && numeric.matches(last.first.id)) {
+            edit.remove(KEY_LAST).remove(KEY_POSITION).putBoolean(KEY_ALIVE, false)
         }
-        if (p.getStringSet(KEY_DEAD, emptySet())?.orEmpty()?.any { !numeric.matches(it) } == true) {
-            p.edit().remove(KEY_DEAD).apply()
+        if (p.getStringSet(KEY_DEAD, emptySet())?.orEmpty()?.any { numeric.matches(it) } == true) {
+            edit.remove(KEY_DEAD)
         }
-        if (p.getStringSet(KEY_BLOCKED, emptySet())?.orEmpty()?.any { !numeric.matches(it) } == true) {
-            p.edit().remove(KEY_BLOCKED).apply()
+        if (p.getStringSet(KEY_BLOCKED, emptySet())?.orEmpty()?.any { numeric.matches(it) } == true) {
+            edit.remove(KEY_BLOCKED)
         }
+        edit.apply()
     }
 
     // ---- What the person listens to ------------------------------------------------------------------------------
@@ -210,23 +207,15 @@ object OnlineStore {
         val raw = prefs(context).getString(KEY_TASTE, null) ?: return emptyMap()
         return runCatching {
             val obj = JSONObject(raw)
-            val map = LinkedHashMap<String, Int>()
-            val keys = obj.keys()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                map[key] = obj.optInt(key)
-            }
-            map
+            obj.keys().asSequence().associateWith { obj.optInt(it) }
         }.getOrDefault(emptyMap())
     }
 
     private fun bumpTaste(context: Context, channel: String, delta: Int) {
         if (channel.isBlank()) return
         val map = taste(context).toMutableMap()
-        map[channel] = ((map[channel] ?: 0) + delta).coerceAtLeast(0)
-        val obj = JSONObject()
-        map.entries.sortedByDescending { it.value }.take(40).forEach { obj.put(it.key, it.value) }
-        prefs(context).edit().putString(KEY_TASTE, obj.toString()).apply()
+        map[channel] = (map[channel] ?: 0) + delta
+        prefs(context).edit().putString(KEY_TASTE, JSONObject(map as Map<*, *>).toString()).apply()
     }
 
     fun recordPlay(context: Context, video: OnlineVideo) = bumpTaste(context, video.channel, 1)
@@ -234,20 +223,13 @@ object OnlineStore {
     fun recordSkip(context: Context, video: OnlineVideo) = bumpTaste(context, video.channel, -1)
 
     fun favoriteChannels(context: Context, limit: Int): List<String> =
-        taste(context).entries.filter { it.value > 0 }.sortedByDescending { it.value }.take(limit).map { it.key }
+        taste(context).entries.filter { it.value > 0 }.sortedByDescending { it.value }.map { it.key }.take(limit)
 
-    /** Videos that could not be played even after every repair step; autoplay never picks them again. */
-    fun dead(context: Context): Set<String> {
-        val limit = System.currentTimeMillis() - 7L * 24L * 3600L * 1000L
-        return (prefs(context).getStringSet(KEY_DEAD, emptySet()) ?: emptySet()).mapNotNull { entry ->
-            val at = entry.substringAfter('@', "").toLongOrNull()
-            if (at != null && at > limit) entry.substringBefore('@') else null
-        }.toSet()
-    }
+    fun dead(context: Context): Set<String> =
+        prefs(context).getStringSet(KEY_DEAD, emptySet())?.toSet() ?: emptySet()
 
     fun addDead(context: Context, id: String) {
-        val keep = (prefs(context).getStringSet(KEY_DEAD, emptySet()) ?: emptySet()).filter { !it.startsWith("$id@") }
-        prefs(context).edit().putStringSet(KEY_DEAD, (keep + "$id@${System.currentTimeMillis()}").takeLast(80).toSet()).apply()
+        prefs(context).edit().putStringSet(KEY_DEAD, dead(context) + id).apply()
     }
 
     /** Small ring buffer of what the watchdog saw and fixed. Never shown; kept for diagnosis. */
@@ -256,115 +238,170 @@ object OnlineStore {
             "${System.currentTimeMillis()} $line").takeLast(40)
         prefs(context).edit().putString(KEY_LOG, lines.joinToString("\n")).apply()
     }
-
-    /** IDs that refuse to play in the embedded player, remembered so a restart goes straight to the watch page. */
-    fun blocked(context: Context): Set<String> =
-        prefs(context).getStringSet(KEY_BLOCKED, emptySet())?.toSet() ?: emptySet()
-
-    fun addBlocked(context: Context, id: String) {
-        prefs(context).edit().putStringSet(KEY_BLOCKED, blocked(context) + id).apply()
-    }
 }
+
+// ---- The embedded YouTube player page -----------------------------------------------------------------------------
 
 private const val PLAYER_HTML = """
 <!DOCTYPE html>
 <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}
-iframe{width:100%;height:100%;border:0}</style></head>
-<body><iframe id="w" allow="autoplay"
-src="https://w.soundcloud.com/player/?url=https%3A%2F%2Fapi.soundcloud.com%2Fplatforms%2Fweb&auto_play=false&buying=false&sharing=false&download=false&show_artwork=false&visual=false&single_active=true"></iframe>
-<script src="https://w.soundcloud.com/player/api.js"></script>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{width:100%;height:100%}</style></head>
+<body><div id="p"></div>
+<script src="https://www.youtube.com/iframe_api"></script>
 <script>
-var widget = null;
-var pendingLoad = null;
-var wantedStart = 0;
-var seenPlaying = false;
-
-function ensureWidget() {
-  if (widget) { return widget; }
-  if (typeof SC === 'undefined' || !SC.Widget) { return null; }
-  var frame = document.getElementById('w');
-  if (!frame) { return null; }
-  try {
-    widget = SC.Widget(frame);
-    widget.bind(SC.Widget.Events.READY, function () { Android.ready(); });
-    widget.bind(SC.Widget.Events.PLAY, function () {
-      seenPlaying = true;
-      window.__playSeen = true;
-      // Resume exactly where the song was cut off: the first PLAY after a load with a wanted start.
-      if (wantedStart > 0) {
-        try { widget.seekTo(wantedStart * 1000); } catch (e) {}
-        wantedStart = 0;
-      }
-      Android.stateChanged(1);
-    });
-    widget.bind(SC.Widget.Events.PAUSE, function () { Android.stateChanged(2); });
-    widget.bind(SC.Widget.Events.FINISH, function () { Android.stateChanged(0); });
-    try {
-      widget.bind(SC.Widget.Events.ERROR, function (e) { Android.failed(-1); });
-    } catch (e2) { /* older api.js without the ERROR event */ }
-    return widget;
-  } catch (e) { return null; }
+var player = null;
+var pending = null;
+var loadId = null;
+function onYouTubeIframeAPIReady() {
+  player = new YT.Player('p', {
+    width: '100%', height: '100%',
+    playerVars: { playsinline: 1, autoplay: 1, controls: 0, rel: 0, origin: 'https://www.youtube.com', enablejsapi: 1, iv_load_policy: 3, modestbranding: 1 },
+    events: {
+      onReady: function () { forceSound(); Android.ready(); },
+      onStateChange: function (e) { if (e.data === 1) { forceSound(); } Android.stateChanged(e.data); },
+      onError: function (e) { Android.failed(e.data); }
+    }
+  });
 }
-
-// The API script loads after this inline script; retry until the widget can be bound.
-var bindTimer = setInterval(function () {
-  var w = ensureWidget();
-  if (w) {
-    clearInterval(bindTimer);
-    if (pendingLoad) { var p = pendingLoad; pendingLoad = null; load(p[0], p[1]); }
-  }
-}, 300);
-
+function forceSound() { try { if (player && player.isMuted && player.isMuted()) { player.unMute(); } if (player && player.setVolume) { player.setVolume(100); } } catch (e) {} }
 function load(id, start) {
-  wantedStart = start || 0;
-  window.__wantPlay = true;
-  window.__playSeen = false;
-  var w = ensureWidget();
-  if (!w) { pendingLoad = [id, start]; return; }
-  try {
-    w.load('https://api.soundcloud.com/tracks/' + id, {
-      auto_play: true,
-      buying: false, sharing: false, downloading: false,
-      show_artwork: false, visual: false, single_active: true,
-      callback: function () {
-        seenPlaying = false;
-        try { w.play(); } catch (e) {}
-        Android.ready();
-      }
-    });
-  } catch (e) { Android.failed(-1); }
+  loadId = id;
+  pending = null;
+  if (player && player.loadVideoById) { player.loadVideoById(id, start || 0); forceSound(); }
+  else { pending = [id, start]; }
 }
-
-function playVideo2() { window.__wantPlay = true; if (widget) { try { widget.play(); } catch (e) {} } }
-function pauseVideo2() { window.__wantPlay = false; if (widget) { try { widget.pause(); } catch (e) {} } }
-function seek(s) { if (widget) { try { widget.seekTo(s * 1000); } catch (e) {} } }
-
-setInterval(function () {
-  if (widget) {
+function playVideo2() { if (player) { player.playVideo(); forceSound(); } }
+function pauseVideo2() { if (player) player.pauseVideo(); }
+function seek(s) { if (player) { player.seekTo(s, true); } }
+function frameDoc() { try { var f = document.querySelector('iframe'); return f ? (f.contentDocument || null) : null; } catch (e) { return null; } }
+var adWasShowing = false;
+// The embed iframe has the same origin as this page, so its ad state can be read and skipped directly:
+// click Skip when offered, otherwise fast-forward the ad to its end while muted. No tap is needed.
+// The app is told about every ad so its "Ads — please wait" chip appears only while one actually runs.
+function killAds() {
+  var d = frameDoc();
+  if (!d) { return; }
+  var showing = !!d.querySelector('.ad-showing, .ad-interrupting');
+  if (showing !== adWasShowing) {
+    adWasShowing = showing;
+    try { Android.adShowing(showing ? 1 : 0); } catch (e) {}
+  }
+  if (showing) {
     try {
-      widget.getPosition(function (pos) {
-        widget.getDuration(function (dur) {
-          Android.time(pos / 1000, dur / 1000);
-        });
-      });
+      var v = d.querySelector('video');
+      if (v) { v.muted = true; v.playbackRate = 16; if (isFinite(v.duration) && v.duration > 0) { v.currentTime = v.duration; } }
+      var b = d.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-container button');
+      if (b) { b.click(); }
+      var c = d.querySelector('.ytp-ad-overlay-close-button');
+      if (c) { c.click(); }
     } catch (e) {}
+  } else if (!adWasShowing) {
+    try { var v2 = d.querySelector('video'); if (v2) { v2.playbackRate = 1; v2.muted = false; } } catch (e) {}
+    forceSound();
+  }
+}
+setInterval(killAds, 250);
+setInterval(function () {
+  if (player && player.getCurrentTime && player.getDuration) {
+    // Only report the video the app actually asked for. While a new video is still loading the
+    // iframe keeps answering for the old one, and those numbers used to leak into the new track.
+    if (loadId === null || loadId === (player.getVideoData ? player.getVideoData().video_id : loadId)) {
+      Android.time(player.getCurrentTime(), player.getDuration());
+    }
   }
 }, 1000);
-// The widget occasionally fires a stray PAUSE right after starting (its own audio focus dance).
-// While the app believes the song should be playing, keep nudging it back to play; harmless otherwise.
-setInterval(function () {
-  try {
-    if (widget && window.__wantPlay && !window.__playSeen) {
-      widget.isPaused(function (paused) {
-        if (paused) { try { widget.play(); } catch (e) {} }
-      });
-    }
-  } catch (e) {}
-}, 2500);
 </script></body></html>
 """
 
+/**
+ * Injected into the normal YouTube watch page when a video refuses to play in the embedded player (most official
+ * music videos). It shows only the video and reports state back through the same bridge, with the same ad skipping.
+ */
+private const val WATCH_JS = """
+(function () {
+  if (window.__mr) { return; }
+  window.__mr = true;
+  try {
+    Object.defineProperty(document, 'hidden', { get: function () { return false; } });
+    Object.defineProperty(document, 'visibilityState', { get: function () { return 'visible'; } });
+    document.addEventListener('visibilitychange', function (e) { e.stopImmediatePropagation(); }, true);
+  } catch (e) {}
+  var st = document.createElement('style');
+  // Hide everything except the video, and blank out the ad slots that survive on the mobile watch page.
+  st.textContent = 'html,body{background:#000!important;overflow:hidden!important}' +
+    'body *{visibility:hidden!important}' +
+    'video{visibility:visible!important;position:fixed!important;top:0!important;left:0!important;' +
+    'width:100vw!important;height:100vh!important;z-index:2147483647!important;background:#000!important;' +
+    'object-fit:contain!important}' +
+    '.ad-showing, .ad-interrupting, ytmusic-video-player, #player-ads, .ytp-ad-module, ' +
+    '.video-ads, .ytp-ad-overlay-container, .ytp-ad-image-overlay, .ytp-ad-progress, ' +
+    '.ytp-ad-text, ytm-playlist-video-renderer, ytm-notification, .masthead-ad, #masthead-ad{display:none!important}';
+  (document.head || document.documentElement).appendChild(st);
+  function forceSound() {
+    try {
+      var mp = document.getElementById('movie_player');
+      if (mp && mp.isMuted && mp.isMuted()) { mp.unMute(); }
+      if (mp && mp.setVolume) { mp.setVolume(100); }
+      var v = document.querySelector('video');
+      if (v) { if (v.muted) { v.muted = false; } if (v.volume < 1) { v.volume = 1; } }
+    } catch (e) {}
+  }
+  function adShowing() { return !!document.querySelector('.ad-showing, .ad-interrupting'); }
+  function pageVideoId() {
+    try {
+      if (window.ytcfg && ytcfg.data_ && ytcfg.data_.videoId) { return ytcfg.data_.videoId; }
+      var m = /[?&]v=([A-Za-z0-9_-]{11})/.exec(location.search);
+      if (m) { return m[1]; }
+    } catch (e) {}
+    return null;
+  }
+  function skipAd() {
+    // Fast-forward the ad to its end (muted) and click "Skip" whenever one is offered. No tap is needed.
+    try {
+      window.__adWas = true;
+      var av = document.querySelector('video');
+      if (av) { av.muted = true; av.playbackRate = 16; if (isFinite(av.duration) && av.duration > 0) { av.currentTime = av.duration; } }
+      var b = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
+      if (b) { b.click(); }
+      var c = document.querySelector('.ytp-ad-overlay-close-button, [aria-label="Close"]');
+      if (c) { c.click(); }
+    } catch (e) {}
+  }
+  function hook() {
+    var v = document.querySelector('video');
+    if (!v || v.__mr) { return; }
+    v.__mr = true;
+    v.addEventListener('playing', function () { forceSound(); Android.stateChanged(1); });
+    v.addEventListener('pause', function () { if (!v.ended && !adShowing()) { Android.stateChanged(2); } });
+    v.addEventListener('ended', function () { if (!adShowing()) { Android.stateChanged(0); } });
+    try { var r = v.play(); if (r && r.catch) { r.catch(function () {}); } } catch (e) {}
+  }
+  window.mrPlay = function () { var v = document.querySelector('video'); if (v) { v.play(); } };
+  window.mrPause = function () { var v = document.querySelector('video'); if (v) { v.pause(); } };
+  window.mrSeek = function (s) { var v = document.querySelector('video'); if (v) { v.currentTime = s; } };
+  setInterval(function () {
+    hook();
+    forceSound();
+    var showing = adShowing();
+    try { Android.adShowing(showing ? 1 : 0); } catch (e) {}
+    if (showing) { skipAd(); }
+    else if (window.__adWas) {
+      window.__adWas = false;
+      var rv = document.querySelector('video');
+      if (rv) { rv.playbackRate = 1; rv.muted = false; }
+    }
+    var v = document.querySelector('video');
+    if (v && v.duration > 0 && isFinite(v.duration) && !adShowing()) {
+      var id = pageVideoId();
+      // The watch page auto-advances to a related video when one ends, and ads can force their own
+      // navigation. Tell the app which video the page is REALLY on so the card and notification
+      // can follow it instead of showing a stale title.
+      Android.pageVideo(id || '');
+      Android.time(v.currentTime, v.duration);
+    }
+  }, 400);
+})();
+"""
 
 private class Bridge {
     @JavascriptInterface
@@ -381,6 +418,9 @@ private class Bridge {
 
     @JavascriptInterface
     fun pageVideo(id: String) = OnlinePlayer.handlePageVideo(id)
+
+    @JavascriptInterface
+    fun adShowing(showing: Int) = OnlinePlayer.handleAdShowing(showing == 1)
 }
 
 object OnlinePlayer {
@@ -451,7 +491,7 @@ object OnlinePlayer {
         view.settings.mediaPlaybackRequiresUserGesture = false
         view.settings.userAgentString =
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
-        // Sandbox: the page can only talk to SoundCloud (widget, artwork and stream delivery). Everything
+        // Sandbox: the page can only talk to YouTube (player, thumbnail and API delivery). Everything
         // else — ads, trackers, pop-ups — is refused before its scripts even run.
         view.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -465,15 +505,6 @@ object OnlinePlayer {
             }
         }
         view.webChromeClient = object : WebChromeClient() {
-            // Label-uploaded songs are delivered as protected (DRM) streams. The page asks for protected-media
-            // access, and without this grant those songs show up but never start.
-            override fun onPermissionRequest(request: PermissionRequest) {
-                val host = request.origin?.host.orEmpty().lowercase()
-                val trusted = host.endsWith("soundcloud.com") || host.endsWith("soundcloud.cloud") || host.endsWith("sndcdn.com")
-                val granted = request.resources.filter { it == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID }
-                if (trusted && granted.isNotEmpty()) request.grant(granted.toTypedArray()) else request.deny()
-            }
-
             // A sandboxed player never opens new windows: every pop-up dies here.
             override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, result: android.os.Message): Boolean {
                 // Returning false refuses the window; nothing is sent through the result message.
@@ -481,22 +512,26 @@ object OnlinePlayer {
             }
         }
         view.addJavascriptInterface(Bridge(), "Android")
+        // YouTube asks for consent in some regions; accept it quietly so the player never stalls on it.
+        runCatching {
+            CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
+            CookieManager.getInstance().setCookie("https://www.youtube.com", "SOCS=CAI; Domain=.youtube.com; Path=/")
+            CookieManager.getInstance().setCookie("https://www.youtube.com", "CONSENT=YES+1; Domain=.youtube.com; Path=/")
+        }
         loadEmbedPage(view)
         web = view
         if (overlayAllowed()) hostInBackground(warn = false)
         return view
     }
 
-    /** SoundCloud hosts plus the few CDN/API hosts the widget and artworks genuinely need. */
+    /** YouTube hosts plus the few CDN hosts the player and thumbnails genuinely need. */
     private fun isAllowedHost(host: String): Boolean {
         val h = host.lowercase()
-        // The audio itself is delivered from SoundCloud's media CDN (playback.media-streaming.soundcloud.cloud)
-        // and, for some tracks, its CDN partners — all of these must pass or the widget plays nothing.
-        if (h.endsWith("soundcloud.com") || h.endsWith("soundcloud.cloud") || h.endsWith("sndcdn.com") ||
-            h.endsWith("sc-cdn.net") || h.endsWith("soundusercontent.com") || h.endsWith("akamaized.net") ||
-            h.endsWith("cloudfront.net") || h.endsWith("media-streaming.soundcloud.cloud")
+        if (h.endsWith("youtube.com") || h.endsWith("youtube-nocookie.com") || h.endsWith("ytimg.com") ||
+            h.endsWith("googlevideo.com") || h.endsWith("ggpht.com") || h.endsWith("googleapis.com") ||
+            h.endsWith("gstatic.com") || h.endsWith("google.ca") || h.endsWith("google.co.uk") || h.endsWith("google.com")
         ) {
-            // Refuse the known ad-serving subdomains even inside otherwise-allowed domains.
+            // Refuse the known ad-serving hosts even inside otherwise-allowed domains.
             val adMarkers = listOf("ads", "adserver", "admob", "doubleclick", "googlesyndication", "adservice", "partnerads", "promote", "impression")
             return adMarkers.none { marker -> h == marker || h.startsWith("$marker.") || h.contains(".$marker.") }
         }
@@ -510,12 +545,29 @@ object OnlinePlayer {
 
     private fun loadEmbedPage(view: WebView) {
         pageReady = false
-        view.loadDataWithBaseURL("https://w.soundcloud.com", PLAYER_HTML, "text/html", "UTF-8", null)
+        OnlineAdState.showing = false
+        view.loadDataWithBaseURL("https://www.youtube.com", PLAYER_HTML, "text/html", "UTF-8", null)
+    }
+
+    /**
+     * Loads the real YouTube watch page and injects [WATCH_JS]: the fallback for videos the embedded
+     * player refuses to play (most official music videos).
+     */
+    private fun loadWatchPage(view: WebView, id: String, start: Double) {
+        pageReady = true
+        view.loadUrl("https://m.youtube.com/watch?v=$id" + if (start > 0) "&t=${start.toInt()}s" else "")
+        runJs("javascript:Android.ready()")
+        main.postDelayed({ injectWatchJs() }, 1_200L)
+        main.postDelayed({ injectWatchJs() }, 3_000L)
+    }
+
+    private fun injectWatchJs() {
+        runJs(WATCH_JS)
     }
 
     // ---- Window placement ---------------------------------------------------------------------------------------
 
-    /** Adds the player view on top of the Activity content. It is parked as a 1px view when not on screen. */
+    /** Adds the player view on top of the Activity content. It is parked as an off-screen invisible view when idle. */
     fun attach(activity: Activity) {
         val view = webView()
         if (overlayAllowed()) {
@@ -528,9 +580,8 @@ object OnlinePlayer {
         releaseOverlay()
         (view.parent as? ViewGroup)?.removeView(view)
         lastPlaced = null
-        // Fully invisible: alpha 0 and parked off-screen (negative margins). The widget keeps
-        // playing from an off-screen window; a 0.02 alpha used to leave a faint grey square
-        // visible whenever the app drew a black screen behind it.
+        // Fully invisible: alpha 0 and parked off-screen (negative margins). The player keeps
+        // playing from an off-screen window; any visible pixel would draw a black box over the app.
         view.alpha = 0f
         view.passThrough = true
         activity.addContentView(view, FrameLayout.LayoutParams(PARK_W, PARK_H).apply {
@@ -694,6 +745,7 @@ object OnlinePlayer {
         positionSec = startSec
         durationSec = 0.0
         OnlineLoading.active = true
+        OnlineAdState.showing = false
         OnlineStore.saveLast(context, video, startSec)
         OnlineStore.setAlive(context, true)
         if (startService) {
@@ -703,12 +755,28 @@ object OnlinePlayer {
         watchToken += 1
         pendingLoad = null
         if (pageReady) {
-            runJs("load('${video.id}',${startSec.toInt()})")
+            // A video blocked in the embed (most official music videos) goes straight to the watch page.
+            if (video.id in OnlineStore::class.java.let { blockedIds(context) }) {
+                loadWatchPage(view, video.id, startSec)
+            } else {
+                runJs("load('${video.id}',${startSec.toInt()})")
+            }
         } else {
             pendingLoad = video.id to startSec
         }
         armWatchTimeout(gen)
         listener?.invoke()
+    }
+
+    /** Ids that refuse the embedded player; remembered so a restart of one goes straight to the watch page. */
+    private fun blockedIds(context: Context): Set<String> =
+        appContext?.getSharedPreferences(MusicPreferences.FILE, Context.MODE_PRIVATE)
+            ?.getStringSet("online_blocked", emptySet())?.toSet() ?: emptySet()
+
+    private fun addBlockedId(id: String) {
+        val context = appContext ?: return
+        context.getSharedPreferences(MusicPreferences.FILE, Context.MODE_PRIVATE)
+            .edit().putStringSet("online_blocked", blockedIds(context) + id).apply()
     }
 
     /** If the song still has not started after a while, repair it quietly. */
@@ -721,7 +789,8 @@ object OnlinePlayer {
 
     /**
      * Silent repair ladder, nothing is shown to the person: 1) reload the song in the same player,
-     * 2) reload the whole player page, 3) give up on that video and move on.
+     * 2) move to the real watch page, 3) reload the whole player page, 4) give up on that video
+     * and move on.
      */
     private fun healFailure(gen: Long) {
         if (gen != generation) return
@@ -735,6 +804,12 @@ object OnlinePlayer {
                 pageReady = false
                 web?.let { loadEmbedPage(it) }
                 startVideo(video, positionSec, false, heal = true)
+            }
+            2 -> {
+                // The embedded player refuses this video (most official music videos): play the real
+                // watch page with the video-only styling instead.
+                web?.let { loadWatchPage(it, video.id, positionSec) }
+                armWatchTimeout(gen)
             }
             else -> giveUp(video)
         }
@@ -797,8 +872,12 @@ object OnlinePlayer {
         }.start()
     }
 
-    private fun jsPlay() = runJs("playVideo2()")
-    private fun jsPause() = runJs("pauseVideo2()")
+    private fun jsPlay() = runJs(
+        "try{ if (window.location.href.indexOf('watch') >= 0) { mrPlay(); } else { playVideo2(); } }catch(e){ playVideo2(); }"
+    )
+    private fun jsPause() = runJs(
+        "try{ if (window.location.href.indexOf('watch') >= 0) { mrPause(); } else { pauseVideo2(); } }catch(e){ pauseVideo2(); }"
+    )
 
     fun toggle() {
         if (state.isPlaying) {
@@ -842,7 +921,7 @@ object OnlinePlayer {
 
     fun seekTo(seconds: Double) {
         positionSec = seconds
-        runJs("seek(${seconds.toInt()})")
+        runJs("try{ if (window.location.href.indexOf('watch') >= 0) { mrSeek(${seconds.toInt()}); } else { seek(${seconds.toInt()}); } }catch(e){ seek(${seconds.toInt()}); }")
     }
 
     // ---- Callbacks from the page (called on a WebView thread) ------------------------------------------------------
@@ -850,7 +929,7 @@ object OnlinePlayer {
     internal fun handleReady() {
         main.post {
             pageReady = true
-            // The track asked for while the page was still loading is sent to the widget now.
+            // The video asked for while the page was still loading is sent to the player now.
             pendingLoad?.let { runJs("load('${it.first}',${it.second.toInt()})") }
             pendingLoad = null
         }
@@ -872,8 +951,8 @@ object OnlinePlayer {
                     context?.let { OnlineStore.setAlive(it, true) }
                 }
                 2 -> {
-                    // A pause does NOT clear the alive marker: the widget fires stray pauses right after
-                    // starting a song, and clearing here would disable crash recovery while the music
+                    // A pause does NOT clear the alive marker: the player fires stray pauses right after
+                    // starting a video, and clearing here would disable crash recovery while the music
                     // is still going. The heartbeat stops marking the session only on a real stop().
                     state = state.copy(isPlaying = false)
                 }
@@ -900,7 +979,14 @@ object OnlinePlayer {
         }
     }
 
-    /** Titles that are long mixes, charts or streams rather than a single song. */
+    /**
+     * After a song ends (or Next is pressed with nothing queued) a similar song is chosen, so the
+     * Online tab NEVER hands playback back to the local library. Songs similar to the one that just
+     * finished (the artist's other songs, covers of the same song) come first; only when that comes
+     * up empty does the old ladder run — the artists the person plays most, then popular songs.
+     * Songs already played, blocked or dead are skipped.
+     */
+    /** True for things that look like a single song (not mixes, streams, playlists or podcasts). */
     private fun looksLikeSong(video: OnlineVideo): Boolean {
         val title = video.title.lowercase()
         val noise = listOf("hours", "hour mix", "top 100", "top 50", "top 20", "top 10", "playlist", " mix", "compilation",
@@ -909,14 +995,6 @@ object OnlinePlayer {
         return title.length < 140 && noise.none { title.contains(it) } && video.playable
     }
 
-    /**
-     * After a song ends (or Next is pressed with nothing queued) a similar song is chosen, so the
-     * Online tab NEVER hands playback back to the local library. SoundCloud's own "related tracks"
-     * list for the song that just finished comes first (that is what the site's station uses);
-     * only when that comes up empty does the old ladder run — the same artist, songs like this one,
-     * the artists the person plays most, then popular songs. Songs already played, blocked or dead
-     * are skipped.
-     */
     private fun autoplaySimilar(context: Context?) {
         val finished = state.video ?: return
         if (context == null || autoplayBusy) return
@@ -928,15 +1006,15 @@ object OnlinePlayer {
         val seed = finished.title.substringBefore(" (").substringBefore(" [").trim()
         OnlineLoading.active = true
         Thread {
-            // 1) SoundCloud's own related tracks for the song that just ended.
-            val related = runCatching { com.musicrage.app.data.OnlineApi.related(finished.id) }.getOrDefault(emptyList())
+            // 1) Songs similar to the one that just ended.
+            val related = runCatching { com.musicrage.app.data.OnlineApi.related(finished) }.getOrDefault(emptyList())
             var pick = related.filter { it.id !in seen && it.id !in avoid && looksLikeSong(it) }.randomOrNull()
-            // 2) The old ladder, only when related came up empty: same artist, this song, favourites, popular.
+            // 2) The old ladder, only when similar came up empty: this song, favourites, popular.
             if (pick == null) {
                 val queries = buildList<String> {
-                    if (artist.isNotBlank()) add(artist)
                     if (seed.isNotBlank()) add(seed)
-                    OnlineStore.favoriteChannels(context, 3).filter { !it.equals(artist, ignoreCase = true) }.forEach { add(it) }
+                    if (artist.isNotBlank()) add("$artist songs")
+                    OnlineStore.favoriteChannels(context, 3).filter { !it.equals(artist, ignoreCase = true) }.forEach { add("$it songs") }
                     add("popular songs")
                 }.distinct()
                 for (query in queries) {
@@ -992,11 +1070,36 @@ object OnlinePlayer {
     }
 
     /**
-     * The widget no longer auto-advances behind the app's back (SoundCloud's single_active widget keeps one
-     * track at a time), so this callback is only a no-op kept for older saved pages.
+     * The watch page reports which video it is really on. If it moved to a video the app did not ask for
+     * (the page auto-advances to a related one, or an ad forced its own navigation), the card, the
+     * notification and the saved position follow it — they never show a stale title.
      */
     internal fun handlePageVideo(id: String) {
-        // Nothing to follow: the app alone decides what plays next.
+        if (id.length != 11) return
+        val gen = generation
+        main.post {
+            if (gen != generation) return@post
+            val current = state.video ?: return@post
+            if (id == current.id) return@post
+            // The page moved somewhere the app did not send it: adopt that video.
+            val context = appContext ?: return@post
+            val adopted = com.musicrage.app.data.OnlineApi.track(id)
+            if (adopted != null) {
+                OnlineStore.addHistory(context, adopted)
+                OnlineStore.recordPlay(context, adopted)
+                OnlineStore.saveLast(context, adopted, 0.0)
+                state = state.copy(video = adopted)
+                listener?.invoke()
+            }
+        }
+    }
+
+    internal fun handleAdShowing(showing: Boolean) {
+        val gen = generation
+        main.post {
+            if (gen != generation && !showing) return@post
+            OnlineAdState.showing = showing
+        }
     }
 
     internal fun handleError(code: Int) {
@@ -1008,7 +1111,19 @@ object OnlinePlayer {
             // The song is already audible; a stray error from an old page must not interrupt it.
             if (!OnlineLoading.active && state.isPlaying && positionSec > 1.0) return@post
             OnlineStore.log(context, "error $code ${video.id}")
-            healFailure(gen)
+            // 101/150 = the embed refuses this video (most official music videos): go to the watch page.
+            if (code == 101 || code == 150 || code == 100) {
+                if (healStage == 0) {
+                    healStage = 1
+                    OnlineStore.log(context, "watch-mode ${video.id}")
+                    web?.let { loadWatchPage(it, video.id, positionSec) }
+                    armWatchTimeout(gen)
+                } else {
+                    healFailure(gen)
+                }
+            } else {
+                healFailure(gen)
+            }
         }
     }
 
@@ -1084,6 +1199,7 @@ object OnlinePlayer {
         watchToken += 1
         jsPause()
         OnlineLoading.active = false
+        OnlineAdState.showing = false
         state = OnlineState()
         positionSec = 0.0
         durationSec = 0.0

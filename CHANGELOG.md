@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0
+- The Online tab is back on YouTube: the embedded YouTube player runs in an invisible sandboxed WebView (only YouTube hosts are ever loaded — ads, trackers and pop-ups are refused before their scripts run), the player never shows and never steals taps, and playback keeps running from the notification after the app is swiped away.
+- Ads are handled on their own: while an ad actually runs the player fast-forwards it muted and clicks Skip whenever the button appears, and the Online tab shows an "Ads — please wait" chip for exactly that time (no chip when no ad runs).
+- Downloads are real MP3s again: the video is converted through mp3juice/thetacloud and saved with a full ID3 tag — title, artist, album and embedded cover art (the cover from YouTube's own thumbnail), so files open with their metadata everywhere.
+- Search runs on YouTube (mp3juice's YouTube results, with a public Piped search as fallback), auto-correct suggests while you type come from YouTube's own suggestion endpoint, and after a song ends the next one is picked from similar music (the artist's other songs, covers, then your most-played artists).
+- The self-healing player now has one more rung: a video the embed refuses to play (most official music videos) quietly reloads in the real watch page with only the video visible, and a playback that freezes gets nudged before it is ever reloaded.
+
 ## 1.2.24
 - Fixed the bug where downloads kept showing "Unknown artist" / no album with a grey tile: the metadata atoms written into the m4a were malformed (the © byte was dropped to '?' by ASCII encoding, the text atoms had a 4-byte misalignment and the cover atom had no data sub-box), so no player — Android's scanner included — could read them. The atoms are now written exactly as iTunes/ffmpeg/mutagen expect them, verified byte-for-byte against those parsers: title, artist, album and cover all read back from a real downloaded file.
 - The MP3 fallback path was verified against the same parsers (its ID3v2.3 tag was already correct; title/artist/album/APIC cover all read back).
