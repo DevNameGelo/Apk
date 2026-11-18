@@ -3,40 +3,68 @@ package com.musicrage.app.data
 import java.io.ByteArrayOutputStream
 
 /**
- * Minimal MP4 (m4a) metadata writer: inserts a `moov.udta.meta.ilst.covr` atom carrying the cover
- * art into the joined HLS stream the downloader saves. Without it every downloaded song showed a
- * grey tile — MediaStore does read embedded MP4 cover art, so writing the atom makes the album
- * art appear in the library (and any other player) immediately.
+ * Minimal MP4 (m4a) metadata writer: inserts `moov.udta.meta.ilst` atoms carrying the track's
+ * title (©nam), artist (©ART), ALBUM (©alb) and cover art (covr) into the joined HLS stream the
+ * downloader saves. Without them every downloaded song showed a grey tile and "Unknown" album —
+ * MediaStore (and every other player) reads these atoms, so the file carries its real metadata
+ * the moment it lands.
  *
- * The HLS join produces a fragmented MP4 (`ftyp`, `moov`, then `styp` + fragments). A cover atom
- * lives inside `moov.udta.meta.ilst`; adding it changes the length of every box on that path, so
- * each enclosing box is rebuilt from the original bytes plus the new child, and the finished moov
- * replaces the old one. No other atom moves.
+ * The HLS join produces a fragmented MP4 (`ftyp`, `moov`, then `styp` + fragments). A metadata
+ * atom lives inside `moov.udta.meta.ilst`; adding them changes the length of every box on that
+ * path, so each enclosing box is rebuilt from the original bytes plus the new children, and the
+ * finished moov replaces the old one. No other atom moves.
  */
 object Mp4TagWriter {
 
     /** Returns [m4a] with a cover atom added (or the input unchanged when it has no recognizable moov). */
-    fun withCover(m4a: ByteArray, cover: ByteArray): ByteArray {
-        val covr = coverAtom(cover)
+    fun withCover(m4a: ByteArray, cover: ByteArray): ByteArray =
+        withMetadata(m4a, null, null, null, cover)
+
+    /**
+     * Returns [m4a] with title/artist/album text atoms and the cover atom added. Blank fields are
+     * skipped, so a track without an album name keeps whatever it already had. The input is
+     * returned unchanged when the file has no recognizable moov box.
+     */
+    fun withMetadata(m4a: ByteArray, title: String?, artist: String?, album: String?, cover: ByteArray?): ByteArray {
+        val children = ArrayList<ByteArray>()
+        title?.takeIf { it.isNotBlank() }?.let { children.add(textAtom("nam", it)) }
+        artist?.takeIf { it.isNotBlank() }?.let { children.add(textAtom("ART", it)) }
+        album?.takeIf { it.isNotBlank() }?.let { children.add(textAtom("alb", it)) }
+        cover?.takeIf { it.size > 100 }?.let { children.add(coverAtom(it)) }
+        if (children.isEmpty()) return m4a
         val moov = findBox(m4a, 0, m4a.size, "moov") ?: return m4a
         val udta = findBox(m4a, moov.bodyStart, moov.bodyEnd, "udta")
         val newMoovBody: ByteArray
         if (udta == null) {
-            newMoovBody = slice(m4a, moov.bodyStart, moov.bodyEnd) + box("udta", fullBox("meta", box("ilst", covr)))
+            newMoovBody = slice(m4a, moov.bodyStart, moov.bodyEnd) + box("udta", fullBox("meta", box("ilst", children)))
         } else {
             // meta is a FullBox: 8-byte header then 4 version/flag bytes, children after those.
             val meta = findBox(m4a, udta.bodyStart, udta.bodyEnd, "meta")
             val newUdtaBody: ByteArray
             if (meta == null) {
-                newUdtaBody = slice(m4a, udta.bodyStart, udta.bodyEnd) + fullBox("meta", box("ilst", covr))
+                newUdtaBody = slice(m4a, udta.bodyStart, udta.bodyEnd) + fullBox("meta", box("ilst", children))
             } else {
                 val ilst = findBox(m4a, meta.bodyStart + 4, meta.bodyEnd, "ilst")
                 val newMetaBody: ByteArray
                 if (ilst == null) {
-                    newMetaBody = slice(m4a, meta.bodyStart, meta.bodyEnd) + box("ilst", covr)
+                    newMetaBody = slice(m4a, meta.bodyStart, meta.bodyEnd) + box("ilst", children)
                 } else {
-                    // Replace the existing ilst with itself plus the covr atom.
-                    val newIlst = box("ilst", slice(m4a, ilst.bodyStart, ilst.bodyEnd) + covr)
+                    // The stream's own ilst may already carry ©nam/©ART (SoundCloud writes them);
+                    // keep the atoms we do NOT rewrite (genre, year…), drop the ones we do, then
+                    // append ours — so the file ends up with exactly one of each, which is what
+                    // every reader (and MediaStore) expects.
+                    val keep = ArrayList<ByteArray>()
+                    var at = ilst.bodyStart
+                    while (at + 8 <= ilst.bodyEnd) {
+                        val size = readUint32(m4a, at)
+                        if (size < 8 || at + size > ilst.bodyEnd) break
+                        val name = String(m4a, at + 4, 4, Charsets.US_ASCII)
+                        if (name != "©nam" && name != "©ART" && name != "©alb" && name != "covr") {
+                            keep.add(slice(m4a, at, at + size))
+                        }
+                        at += size
+                    }
+                    val newIlst = box("ilst", keep + children)
                     newMetaBody = replaceRange(
                         slice(m4a, meta.bodyStart, meta.bodyEnd),
                         ilst.start - meta.bodyStart until ilst.end - meta.bodyStart,
@@ -83,6 +111,20 @@ object Mp4TagWriter {
 
     // ---- Box building ---------------------------------------------------------------------------------------------------
 
+    /**
+     * A text metadata atom (©nam/©ART/©alb…): the 4-byte meaning code (0x01 = UTF-8 text), then
+     * a "data" sub-box whose type says "UTF-8 string" (0x01), then the bytes of the text.
+     */
+    private fun textAtom(name: String, text: String): ByteArray {
+        val data = ByteArrayOutputStream()
+        writeUint32(data, 1) // meaning = text
+        writeUint32(data, 0x00000001) // type flags: UTF-8
+        writeUint32(data, 0) // locale
+        data.write(text.toByteArray(Charsets.UTF_8))
+        val payload = box("data", data.toByteArray())
+        return box("©$name", payload)
+    }
+
     /** covr is itself a FullBox: 4 type bytes (13 = jpeg, 14 = png) then the image. */
     private fun coverAtom(cover: ByteArray): ByteArray {
         val payload = ByteArrayOutputStream()
@@ -99,6 +141,17 @@ object Mp4TagWriter {
         writeUint32(out, 8 + payload.size)
         out.write(type.toByteArray(Charsets.US_ASCII))
         out.write(payload)
+        return out.toByteArray()
+    }
+
+    /** ilst accepts several children; each is appended in order. */
+    private fun box(type: String, payload: List<ByteArray>): ByteArray {
+        val out = ByteArrayOutputStream()
+        var size = 8
+        for (p in payload) size += p.size
+        writeUint32(out, size)
+        out.write(type.toByteArray(Charsets.US_ASCII))
+        for (p in payload) out.write(p)
         return out.toByteArray()
     }
 

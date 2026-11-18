@@ -309,14 +309,36 @@ class MainActivity : ComponentActivity() {
      * behind (a file MediaStore still indexes) is mopped up with a raw File.delete() on the real
      * path, so nothing can survive as a ghost entry that reappears after a rescan.
      */
+    private var deleteAllUris: List<Uri> = emptyList()
+    private var deletePaths: Map<Uri, String?> = emptyMap()
+
+    /** "All files access" lets the app delete and rename the real files of any song, in any folder. */
+    internal fun hasAllFilesAccess(): Boolean =
+        Build.VERSION.SDK_INT < 30 || android.os.Environment.isExternalStorageManager()
+
+    internal fun requestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT < 30) return
+        try {
+            startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+        } catch (error: Exception) {
+            runCatching { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
+        }
+    }
+
     internal fun deleteAudioTracks(tracks: List<AudioTrack>) {
         val uris = tracks.map { it.uri }.distinct()
         if (uris.isEmpty()) return
+        // The real file paths are read now: once MediaStore forgets a song, its path is gone too.
+        deleteAllUris = uris
+        deletePaths = uris.associateWith { realPath(it) }
         pendingDeleteUris = uris
         deleteTotal = uris.size
         deleteDone = 0
         deleteRetried = false
-        if (Build.VERSION.SDK_INT >= 30) {
+        if (Build.VERSION.SDK_INT >= 30 && hasAllFilesAccess()) {
+            // All files access: the files are removed directly, no system dialog needed.
+            finishDelete()
+        } else if (Build.VERSION.SDK_INT >= 30) {
             requestSystemDelete(uris)
         } else {
             // Android 10 asks for permission file by file, so the files are processed one after another.
@@ -380,15 +402,42 @@ class MainActivity : ComponentActivity() {
         return deleted
     }
 
+    /**
+     * The disk is the truth: a song counts as deleted only when its file is really gone from storage.
+     * Anything the system dialog left behind is removed directly, and whatever still cannot be removed is
+     * reported instead of being silently hidden from the app.
+     */
     private fun finishDelete() {
-        // Mop-up: anything still indexed after the approved dialog/direct delete is deleted from
-        // the disk directly (a ghost row means the file is really still there).
-        pendingDeleteUris.filter { uriExists(it) }.forEach { uri ->
-            if (deleteFileOnDisk(uri)) deleteDone += 1
+        var gone = 0
+        var stuck = 0
+        for (uri in deleteAllUris) {
+            val path = deletePaths[uri]
+            if (path != null) {
+                val file = java.io.File(path)
+                if (file.exists()) runCatching { file.delete() }
+                if (file.exists()) {
+                    stuck += 1
+                } else {
+                    runCatching { contentResolver.delete(uri, null, null) }
+                    gone += 1
+                }
+            } else if (uriExists(uri)) {
+                runCatching { contentResolver.delete(uri, null, null) }
+                if (uriExists(uri)) stuck += 1 else gone += 1
+            } else {
+                gone += 1
+            }
         }
         pendingDeleteUris = emptyList()
+        deleteAllUris = emptyList()
+        deleteDone = gone
         scanVersion.intValue += 1
-        toast("Deleted $deleteDone of $deleteTotal")
+        if (stuck > 0 && !hasAllFilesAccess()) {
+            toast("Deleted $gone of $deleteTotal. Allow \"All files access\" to remove the rest from storage")
+            requestAllFilesAccess()
+        } else {
+            toast("Deleted $gone of $deleteTotal")
+        }
     }
 
     private fun uriExists(uri: Uri): Boolean = runCatching {
@@ -405,13 +454,16 @@ class MainActivity : ComponentActivity() {
      */
     internal fun renameAudioTrack(track: AudioTrack, newTitle: String) {
         val title = newTitle.trim().ifBlank { return }
-        MusicPreferences.setTitleOverride(this, track.key, title)
-        scanVersion.intValue += 1
-
         val extension = track.displayName.substringAfterLast('.', "")
-        val safe = title.replace(Regex("[\\/:*?\"<>|]"), " ").trim().ifBlank { return }
+        // Characters Android does not allow in a file name are replaced with a space.
+        val safe = title.map { if (it in "\\/:*?\"<>|") ' ' else it }.joinToString("").trim().ifBlank { return }
         val fileName = if (extension.isNotEmpty()) "$safe.$extension" else safe
         pendingRename = Triple(track.uri, fileName, title)
+        if (Build.VERSION.SDK_INT >= 30 && hasAllFilesAccess()) {
+            // All files access: rename the real file directly.
+            renameByCopy(track.uri, fileName, title)
+            return
+        }
         try {
             if (Build.VERSION.SDK_INT >= 30) {
                 val request = MediaStore.createWriteRequest(contentResolver, listOf(track.uri))
@@ -430,38 +482,50 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** MediaStore rename (keeps the same song id). Counts only when the file on storage really has the new name. */
     private fun updateFileName(uri: Uri, fileName: String, title: String) {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
             put(MediaStore.Audio.Media.TITLE, title)
         }
         val changed = runCatching { contentResolver.update(uri, values, null, null) }.getOrDefault(0)
+        val newPath = realPath(uri)
+        val renamed = changed > 0 && newPath != null && java.io.File(newPath).let { it.name == fileName && it.exists() }
         pendingRename = null
-        if (changed > 0) {
-            toast("Renamed")
+        if (renamed) {
+            finishRename(uri.toString(), title, "Renamed")
         } else {
-            // MediaStore refused (some OEMs keep DISPLAY_NAME read-only): rename the bytes on disk.
+            // MediaStore refused (some phones keep the name read-only): rename the file itself.
             renameByCopy(uri, fileName, title)
         }
+    }
+
+    /** The name shown in the app follows the file, so the list never disagrees with the storage. */
+    private fun finishRename(songKey: String, title: String, message: String) {
+        MusicPreferences.setTitleOverride(this, songKey, title)
         scanVersion.intValue += 1
+        toast(message)
+    }
+
+    private fun renameFailed(message: String) {
+        pendingRename = null
+        toast(message)
+        if (!hasAllFilesAccess()) requestAllFilesAccess()
     }
 
     /**
-     * Physical rename used when MediaStore will not do it: the file's bytes are copied to the
-     * new name next to it, the old file is deleted, and the new file is scanned in. Works on any
-     * folder the app can read; the storage ends up holding the new name, not just the app.
+     * Direct rename of the physical file, then a media scan. The renamed file becomes a new MediaStore entry, so its
+     * favorites, playlists and shown name move to the new entry as soon as the scan reports it.
      */
     private fun renameByCopy(uri: Uri, fileName: String, title: String) {
         val path = realPath(uri)
         if (path == null) {
-            pendingRename = null
-            toast("Renamed in the app. The file name could not be changed.")
+            renameFailed("The file could not be renamed. Allow \"All files access\" and try again")
             return
         }
         val source = java.io.File(path)
         if (!source.exists()) {
-            pendingRename = null
-            toast("Renamed in the app. The file was not found on storage.")
+            renameFailed("The file was not found on storage")
             return
         }
         val target = java.io.File(source.parentFile, fileName)
@@ -471,17 +535,24 @@ class MainActivity : ComponentActivity() {
             return
         }
         Thread {
-            val ok = runCatching {
-                source.renameTo(target)
-            }.getOrDefault(false)
+            val ok = runCatching { source.absolutePath == target.absolutePath || source.renameTo(target) }.getOrDefault(false)
             runOnUiThread {
-                pendingRename = null
-                if (ok) {
-                    scanVersion.intValue += 1
-                    android.media.MediaScannerConnection.scanFile(this, arrayOf(target.absolutePath), null, null)
-                    toast("Renamed the file")
+                if (!ok) {
+                    renameFailed("Android did not allow renaming the file. Allow \"All files access\" and try again")
                 } else {
-                    toast("Renamed in the app. Android did not allow renaming the file.")
+                    pendingRename = null
+                    val oldKey = uri.toString()
+                    android.media.MediaScannerConnection.scanFile(this, arrayOf(target.absolutePath), null) { _, newUri ->
+                        runOnUiThread {
+                            val newKey = newUri?.toString() ?: oldKey
+                            if (newKey != oldKey) {
+                                MusicPreferences.replaceSongKey(this, oldKey, newKey)
+                                runCatching { contentResolver.delete(uri, null, null) }
+                                dataVersion.intValue += 1
+                            }
+                            finishRename(newKey, title, "Renamed the file")
+                        }
+                    }
                 }
             }
         }.start()

@@ -692,6 +692,7 @@ fun SettingsScreen(activity: MainActivity, songCount: Int, onBack: () -> Unit, o
     val playOver = remember(tick) { MusicPreferences.playOverOthers(activity) }
     val floating = remember(tick) { MusicPreferences.floatingEnabled(activity) }
     val battery = remember(tick) { activity.isBatteryUnrestricted() }
+    val allFiles = remember(tick) { activity.hasAllFilesAccess() }
 
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
@@ -734,10 +735,17 @@ fun SettingsScreen(activity: MainActivity, songCount: Int, onBack: () -> Unit, o
         item { SettingAction(R.drawable.ic_refresh, "Rescan music", "$songCount songs found", "Rescan") { onRescan() } }
         item { SettingAction(R.drawable.ic_download, "Back up playlists and favorites", "Save to a file.", "Save") { activity.startBackupExport() } }
         item { SettingAction(R.drawable.ic_upload, "Restore from backup", "Merge a saved backup into this app.", "Restore") { activity.startBackupImport() } }
+        item {
+            SettingAction(
+                R.drawable.ic_pencil, "All files access",
+                if (allFiles) "Allowed. Delete and rename change the real files on storage." else "Lets delete and rename change the real files on storage.",
+                if (allFiles) null else "Allow"
+            ) { activity.requestAllFilesAccess() }
+        }
         item { SettingsGroup("About") }
         item {
             Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
-                Text("Music Rage 1.2.19", color = Color.White, fontSize = 15.sp)
+                Text("Music Rage 1.2.22", color = Color.White, fontSize = 15.sp)
                 Text("Made by Angelo", color = Rage.Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                 Text("Offline and online music player", color = Rage.TextDim, fontSize = 13.sp)
             }

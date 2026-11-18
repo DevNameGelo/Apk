@@ -148,6 +148,17 @@ object MusicPreferences {
         prefs(context).edit().putString(TITLE_OVERRIDES, current.toString()).apply()
     }
 
+    /** A renamed file becomes a new MediaStore entry; favorites and playlists follow it. */
+    fun replaceSongKey(context: Context, oldKey: String, newKey: String) {
+        val favorites = favorites(context)
+        if (oldKey in favorites) saveFavorites(context, favorites - oldKey + newKey)
+        savePlaylists(context, playlists(context).map { playlist ->
+            playlist.copy(songKeys = playlist.songKeys.map { if (it == oldKey) newKey else it }.distinct())
+        })
+        val overrides = titleOverrides(context)
+        overrides[oldKey]?.let { setTitleOverride(context, newKey, it) }
+    }
+
     // ---- Backup / restore -------------------------------------------------------------------------------------
 
     /** Serializes favorites and playlists together with enough song info to re-match files after a reinstall. */

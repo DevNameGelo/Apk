@@ -82,6 +82,7 @@ object OnlineStore {
         // the Online tab when an entry from an older build was rewritten, so it is never stored.
         .put("duration", if (video.duration.isNaN() || video.duration < 0) 0.0 else video.duration)
         .put("playable", video.playable)
+        .put("album", video.album)
 
     private fun fromJson(obj: JSONObject) = OnlineVideo(
         obj.optString("id"),
@@ -92,7 +93,10 @@ object OnlineStore {
         // Entries saved by 1.2.17 have no "duration"; the no-fallback optDouble would hand back NaN
         // and blow up the very next save. Anything unreadable counts as "unknown" (0), not NaN.
         obj.optDouble("duration", 0.0).takeUnless { it.isNaN() } ?: 0.0,
-        obj.optBoolean("playable", true)
+        obj.optBoolean("playable", true),
+        obj.optLong("likes", 0L),
+        // Older entries have no "album"; the download falls back to the song title when blank.
+        obj.optString("album")
     )
 
     fun saveLast(context: Context, video: OnlineVideo, positionSec: Double) {

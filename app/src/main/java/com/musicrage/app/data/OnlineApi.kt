@@ -35,7 +35,9 @@ data class OnlineVideo(
     val permalink: String = "",
     val duration: Double = 0.0,
     val playable: Boolean = true,
-    val likes: Long = 0L
+    val likes: Long = 0L,
+    /** The album the song belongs to, from SoundCloud's own release data (publisher album title, or the release/label name). */
+    val album: String = ""
 )
 
 object OnlineApi {
@@ -166,8 +168,31 @@ object OnlineApi {
             // A preview-only track reports its preview length, not the full one.
             duration = (t.optDouble("full_duration", 0.0).takeIf { it > 0 } ?: t.optDouble("duration", 0.0)) / 1000.0,
             playable = hasPlayableTranscoding(t),
-            likes = t.optLong("likes_count", 0L)
+            likes = t.optLong("likes_count", 0L),
+            // SoundCloud has no plain "album" field on a track; the real album name lives in the
+            // publisher/release metadata (label releases fill "album_title", indies fill "release"
+            // or name the release after the song). Fall back to the label, then the song title —
+            // a downloaded file should never end up with a made-up album like "Music Rage Downloads".
+            album = trackAlbum(t)
         )
+    }
+
+    /** The album name of a track, resolved from every place SoundCloud keeps it. */
+    private fun trackAlbum(t: JSONObject): String {
+        val publisher = t.optJSONObject("publisher_metadata")
+        val fromPublisher = publisher?.optString("album_title").orEmpty()
+        if (fromPublisher.isNotBlank()) return fromPublisher.trim()
+        val fromPublisherRelease = publisher?.optString("release_title").orEmpty()
+        if (fromPublisherRelease.isNotBlank()) return fromPublisherRelease.trim()
+        val release = t.optString("release")
+        if (release.isNotBlank()) return release.trim()
+        val label = t.optString("label_name")
+        if (label.isNotBlank()) return label.trim()
+        val metadataArtist = t.optString("metadata_artist")
+        if (metadataArtist.isNotBlank()) return metadataArtist.trim()
+        // No release data at all: the song is a single — its title is the album, like a single
+        // on any other music platform, so the library groups it under its own name.
+        return t.optString("title").trim()
     }
 
     /**
@@ -589,18 +614,19 @@ object OnlineApi {
         private set
 
     /**
-     * Saves an m4a download. A "moov.udta.meta.ilst.covr" atom with the track's cover art is inserted
-     * into the MP4 (see [Mp4TagWriter]), so the file carries its album art and the library shows it
-     * immediately instead of a grey tile.
+     * Saves an m4a download. "moov.udta.meta.ilst" atoms with the track's title, artist, ALBUM and
+     * cover art are inserted into the MP4 (see [Mp4TagWriter]), so the file carries its real
+     * metadata — the library (and every other player) shows the song's own album, not a made-up one.
      */
     fun saveM4a(context: Context, bytes: ByteArray, video: OnlineVideo, seconds: Double, cover: ByteArray?) {
         val safe = safeName(video)
+        val album = video.album.ifBlank { safe }
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Audio.Media.DISPLAY_NAME, "$safe.m4a")
             put(MediaStore.Audio.Media.TITLE, safe)
             put(MediaStore.Audio.Media.ARTIST, video.channel)
-            put(MediaStore.Audio.Media.ALBUM, "Music Rage Downloads")
+            put(MediaStore.Audio.Media.ALBUM, album)
             put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
             put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/Music Rage")
             put(MediaStore.Audio.Media.IS_PENDING, 1)
@@ -612,7 +638,9 @@ object OnlineApi {
         val target = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
             ?: throw ApiException("Save failed: could not create the file")
         try {
-            val payload = if (cover != null) runCatching { Mp4TagWriter.withCover(bytes, cover) }.getOrDefault(bytes) else bytes
+            val payload = runCatching {
+                Mp4TagWriter.withMetadata(bytes, safe, video.channel, album, cover)
+            }.getOrDefault(bytes)
             resolver.openOutputStream(target)?.use { it.write(payload) }
                 ?: throw ApiException("Save failed: could not write the file")
             values.clear()
@@ -806,17 +834,19 @@ object OnlineApi {
 
     /**
      * Streams the MP3, embeds its metadata and cover art, and saves it into Music/Music Rage.
-     * The ID3 tag (title, artist, album, embedded APIC cover) is written by [Id3Writer], so the
-     * file is complete the moment it lands — no grey tiles, no "Unknown artist".
+     * The ID3 tag (title, artist, real album, embedded APIC cover) is written by [Id3Writer], so
+     * the file is complete the moment it lands — no grey tiles, no "Unknown artist", and the album
+     * is the song's own album instead of a made-up one.
      */
     fun saveMp3(context: Context, url: String, video: OnlineVideo, cover: ByteArray?) {
         val safe = safeName(video)
+        val album = video.album.ifBlank { safe }
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Audio.Media.DISPLAY_NAME, "$safe.mp3")
             put(MediaStore.Audio.Media.TITLE, safe)
             put(MediaStore.Audio.Media.ARTIST, video.channel)
-            put(MediaStore.Audio.Media.ALBUM, "Music Rage Downloads")
+            put(MediaStore.Audio.Media.ALBUM, album)
             put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
             put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/Music Rage")
             put(MediaStore.Audio.Media.IS_PENDING, 1)
@@ -830,7 +860,7 @@ object OnlineApi {
             val bytes = downloadBytesWithProgress(url)
             val out = bytes ?: throw ApiException("Download failed: nothing was received")
             val tagged = runCatching {
-                val tag = Id3Writer.buildTag(safe, video.channel, "Music Rage Downloads", cover)
+                val tag = Id3Writer.buildTag(safe, video.channel, album, cover)
                 if (tag != null) Id3Writer.prependTag(out, tag) else out
             }.getOrDefault(out)
             resolver.openOutputStream(target)?.use { it.write(tagged) }

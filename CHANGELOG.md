@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.23
+- Downloads now carry the song's REAL album, not a placeholder: the album comes from SoundCloud's own release data (the label's album title, the release title, the label name, or the song title for a single), so a downloaded file is grouped under its actual album in every player.
+- m4a downloads embed the full metadata now: title, artist and ALBUM text atoms (©nam/©ART/©alb) are written next to the cover atom, and any title/artist the stream already carried is REPLACED instead of duplicated, so the file has exactly one of each.
+- The album, artist and title are also written into the media library row itself, so the Music Rage list and the Android library show them immediately.
+
+## 1.2.22
+- Delete now removes the real file. The app reads each song's file path before deleting, and afterwards checks the disk: a song counts as deleted only when its file is really gone. Anything the system dialog left behind is removed directly, and what still cannot be removed is reported ("Deleted 3 of 5") instead of being silently hidden from the list.
+- Rename now changes the real file name first. The name shown in the app is updated only after the file on storage was renamed, so the list can no longer disagree with the storage. A renamed file keeps its favorites, playlists and shown name.
+- New "All files access" setting (Settings > Library). With it, delete and rename work directly on the files with no system dialog and in any folder; without it the system dialog is still used, and the app asks for it when Android blocks a change.
+
 ## 1.2.21
 - Songs that showed up but never played (the play button stayed on pause): label-uploaded songs arrive as protected (DRM) streams, and the hidden player never granted the protected-media permission the page asks for, so those streams could not start. The player now grants it to SoundCloud pages only.
 - The playable check now follows SoundCloud's own flags: a track whose access is preview or blocked, whose policy is SNIP or BLOCK, or whose only streams are marked snipped (30-second previews) no longer counts as playable. Playable songs are listed first.
