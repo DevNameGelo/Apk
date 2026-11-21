@@ -10,6 +10,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -199,75 +204,115 @@ fun MusicRageApp(activity: MainActivity) {
         return
     }
 
-    Box(Modifier.fillMaxSize().background(Rage.Bg)) {
-        Column(Modifier.fillMaxSize()) {
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                when {
-                    showSettings -> SettingsScreen(
-                        activity = activity,
-                        songCount = tracks.size,
-                        onBack = { showSettings = false },
-                        onRescan = { rescan() }
-                    )
-                    topDetail != null -> DetailScreen(
-                        target = topDetail,
-                        lib = lib,
-                        actions = actions,
-                        onBack = { detailStack.removeAt(detailStack.lastIndex) },
-                        onPlayAll = { list, shuffle ->
-                            if (list.isNotEmpty()) connection.playQueue(list, if (shuffle) Random.nextInt(list.size) else 0, shuffle)
-                        },
-                        onRenamePlaylist = { renamePlaylist = it },
-                        onDeletePlaylist = { deletePlaylist = it }
-                    )
-                    else -> when (tab) {
-                        MainTab.Home -> HomeScreen(
-                            lib = lib,
-                            actions = actions,
-                            permissionGranted = permissionGranted,
-                            loaded = loaded,
-                            onOpen = { detailStack.add(it) },
-                            onSettings = { showSettings = true },
-                            onGrant = { activity.requestAudioPermission() },
-                            onRescan = { rescan() }
-                        )
-                        MainTab.Songs -> SongsScreen(
-                            lib = lib,
-                            actions = actions,
-                            onStartSelect = { selectMode = true },
-                            onSelectAll = { list -> selectMode = true; selectedKeys = list.map { it.key }.toSet() }
-                        )
-                        MainTab.Online -> OnlineScreen(activity)
-                        MainTab.Search -> SearchScreen(lib = lib, actions = actions, onOpen = { detailStack.add(it) })
-                        MainTab.Library -> LibraryScreen(
-                            lib = lib,
-                            actions = actions,
-                            filter = filter,
-                            onFilter = { filter = it },
-                            onOpen = { detailStack.add(it) },
-                            onCreatePlaylist = { showCreate = true }
+    val content: @Composable () -> Unit = {
+        when {
+            showSettings -> SettingsScreen(
+                activity = activity,
+                songCount = tracks.size,
+                onBack = { showSettings = false },
+                onRescan = { rescan() }
+            )
+            topDetail != null -> DetailScreen(
+                target = topDetail,
+                lib = lib,
+                actions = actions,
+                onBack = { detailStack.removeAt(detailStack.lastIndex) },
+                onPlayAll = { list, shuffle ->
+                    if (list.isNotEmpty()) connection.playQueue(list, if (shuffle) Random.nextInt(list.size) else 0, shuffle)
+                },
+                onRenamePlaylist = { renamePlaylist = it },
+                onDeletePlaylist = { deletePlaylist = it }
+            )
+            else -> when (tab) {
+                MainTab.Home -> HomeScreen(
+                    lib = lib,
+                    actions = actions,
+                    permissionGranted = permissionGranted,
+                    loaded = loaded,
+                    onOpen = { detailStack.add(it) },
+                    onSettings = { showSettings = true },
+                    onGrant = { activity.requestAudioPermission() },
+                    onRescan = { rescan() }
+                )
+                MainTab.Songs -> SongsScreen(
+                    lib = lib,
+                    actions = actions,
+                    onStartSelect = { selectMode = true },
+                    onSelectAll = { list -> selectMode = true; selectedKeys = list.map { it.key }.toSet() }
+                )
+                MainTab.Online -> OnlineScreen(activity)
+                MainTab.Search -> SearchScreen(lib = lib, actions = actions, onOpen = { detailStack.add(it) })
+                MainTab.Library -> LibraryScreen(
+                    lib = lib,
+                    actions = actions,
+                    filter = filter,
+                    onFilter = { filter = it },
+                    onOpen = { detailStack.add(it) },
+                    onCreatePlaylist = { showCreate = true }
+                )
+            }
+        }
+    }
+
+    // ONE player bar. Whichever player is actually playing owns it, so playing a local song after an online one
+    // (or the other way round) always shows the right controls instead of a stale bar from the other player.
+    val playerBar: @Composable () -> Unit = {
+        val onlineVideo = OnlinePlayer.state.video
+        val showOnline = onlineVideo != null && (OnlinePlayer.state.isPlaying || !(snap.hasMedia && snap.isPlaying))
+        if (showOnline) {
+            OnlineMiniBar { tab = MainTab.Online; detailStack.clear(); showSettings = false }
+        } else if (snap.hasMedia) {
+            MiniPlayer(
+                connection = connection,
+                favorite = snap.mediaId != null && snap.mediaId in favorites,
+                onToggleFavorite = { snap.mediaId?.let { toggleFavorite(it) } },
+                onOpen = { nowPlayingOpen = true }
+            )
+        }
+    }
+
+    val selectTab: (MainTab) -> Unit = {
+        tab = it
+        detailStack.clear()
+        showSettings = false
+        selectedKeys = emptySet(); selectMode = false
+    }
+
+    BoxWithConstraints(Modifier.fillMaxSize().background(Rage.Bg)) {
+        // Tablets and large windows get the desktop layout: a side rail instead of the bottom bar, content in a
+        // readable column, and (on very wide screens) a permanent player panel on the right.
+        val wide = maxWidth >= 700.dp
+        val localPlaying = snap.hasMedia && !(OnlinePlayer.state.video != null && OnlinePlayer.state.isPlaying)
+        val panel = maxWidth >= 1000.dp && localPlaying
+        if (wide) {
+            Row(Modifier.fillMaxSize()) {
+                SideRail(tab, selectTab, onSettings = { showSettings = true; detailStack.clear() })
+                Column(Modifier.weight(1f).fillMaxHeight()) {
+                    Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                        Box(Modifier.widthIn(max = 960.dp).fillMaxSize()) { content() }
+                    }
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Box(Modifier.widthIn(max = 960.dp)) { playerBar() }
+                    }
+                }
+                if (panel) {
+                    Box(Modifier.width(340.dp).fillMaxHeight()) {
+                        NowPlayingScreen(
+                            connection = connection,
+                            favorite = snap.mediaId != null && snap.mediaId in favorites,
+                            onToggleFavorite = { snap.mediaId?.let { toggleFavorite(it) } },
+                            onClose = {},
+                            onFloating = { activity.setFloatingPlayer(true) },
+                            showClose = false
                         )
                     }
                 }
             }
-            // ONE player bar. Online playback shows here too (the Online tab uses this same player),
-            // so the two players can never stack two bars again.
-            val onlineVideo = OnlinePlayer.state.video
-            if (onlineVideo != null) {
-                OnlineMiniBar { tab = MainTab.Online; detailStack.clear(); showSettings = false }
-            } else if (snap.hasMedia) {
-                MiniPlayer(
-                    connection = connection,
-                    favorite = snap.mediaId != null && snap.mediaId in favorites,
-                    onToggleFavorite = { snap.mediaId?.let { toggleFavorite(it) } },
-                    onOpen = { nowPlayingOpen = true }
-                )
-            }
-            BottomNav(tab) {
-                tab = it
-                detailStack.clear()
-                showSettings = false
-                selectedKeys = emptySet(); selectMode = false
+        } else {
+            Column(Modifier.fillMaxSize()) {
+                Box(Modifier.weight(1f).fillMaxWidth()) { content() }
+                playerBar()
+                BottomNav(tab, selectTab)
             }
         }
 
@@ -524,6 +569,24 @@ private fun BottomNav(tab: MainTab, onSelect: (MainTab) -> Unit) {
         NavItem("Online", R.drawable.ic_globe, tab == MainTab.Online, Modifier.weight(1f)) { onSelect(MainTab.Online) }
         NavItem("Search", if (tab == MainTab.Search) R.drawable.ic_search_bold else R.drawable.ic_search, tab == MainTab.Search, Modifier.weight(1f)) { onSelect(MainTab.Search) }
         NavItem("Library", if (tab == MainTab.Library) R.drawable.ic_library_bold else R.drawable.ic_library, tab == MainTab.Library, Modifier.weight(1f)) { onSelect(MainTab.Library) }
+    }
+}
+
+@Composable
+private fun SideRail(tab: MainTab, onSelect: (MainTab) -> Unit, onSettings: () -> Unit) {
+    Column(
+        Modifier.width(92.dp).fillMaxHeight().background(Color(0xFF0E0E12))
+            .statusBarsPadding().navigationBarsPadding().padding(vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        NavItem("Home", if (tab == MainTab.Home) R.drawable.ic_home_fill else R.drawable.ic_home, tab == MainTab.Home, Modifier.fillMaxWidth()) { onSelect(MainTab.Home) }
+        NavItem("Songs", R.drawable.ic_music, tab == MainTab.Songs, Modifier.fillMaxWidth()) { onSelect(MainTab.Songs) }
+        NavItem("Online", R.drawable.ic_globe, tab == MainTab.Online, Modifier.fillMaxWidth()) { onSelect(MainTab.Online) }
+        NavItem("Search", if (tab == MainTab.Search) R.drawable.ic_search_bold else R.drawable.ic_search, tab == MainTab.Search, Modifier.fillMaxWidth()) { onSelect(MainTab.Search) }
+        NavItem("Library", if (tab == MainTab.Library) R.drawable.ic_library_bold else R.drawable.ic_library, tab == MainTab.Library, Modifier.fillMaxWidth()) { onSelect(MainTab.Library) }
+        Spacer(Modifier.weight(1f))
+        IconAction(R.drawable.ic_settings, onSettings, contentDescription = "Settings")
     }
 }
 

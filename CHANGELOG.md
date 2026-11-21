@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.33
+- Fixed the Online player showing one song while another kept playing (and then ignoring pause, back and next, even from the notification). The player controls only worked when the app's own "watch page" flag matched the page that was really loaded; when they disagreed every command (load, pause, seek) silently did nothing. The page now reports its own type, the controls work on either page, the old song is silenced before the new one loads, events and the one-second "which video is really loaded" report from the previous song can no longer make the new song look live, and if the screen and the sound ever disagree the app repairs it by itself. A stale watch-page script can no longer be injected into the embed page after a switch.
+- Fixed the bottom player bar staying on the online song after you start a local one: the bar now follows whichever player is actually playing.
+- The UI now fits any screen. Phones narrower than 360 dp scale everything down in proportion instead of clipping, very large system font sizes are capped so buttons stay on screen, and the full-screen player has a landscape layout (art on the left, controls on the right) and a tighter layout on short screens.
+- Tablets and large windows get a desktop layout: a side navigation rail instead of the bottom bar, content in a centered readable column, and on very wide screens a permanent now-playing panel on the right.
+
 ## 1.2.32
 - Fixed: playing a different song while one is already playing sometimes did nothing — the click was silently ignored and the old song kept going (this happened while the player was in its watch-page fallback, which had no way to receive the new song).
 - Fixed: after a song ended and auto-next picked the next one, the mini player and notification kept showing the previous song's title and album art while different music was playing.

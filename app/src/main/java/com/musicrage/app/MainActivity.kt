@@ -32,6 +32,7 @@ import com.musicrage.app.playback.AppVisibility
 import com.musicrage.app.playback.PlaybackService
 import com.musicrage.app.playback.PlayerConnection
 import com.musicrage.app.ui.MusicRageApp
+import com.musicrage.app.ui.AdaptiveDensity
 import com.musicrage.app.ui.MusicRageTheme
 
 class MainActivity : ComponentActivity() {
@@ -73,7 +74,9 @@ class MainActivity : ComponentActivity() {
         audioPermissionState.value = hasAudioPermission()
         setContent {
             MusicRageTheme {
-                MusicRageApp(activity = this)
+                AdaptiveDensity {
+                    MusicRageApp(activity = this)
+                }
             }
         }
         // An ACTION_VIEW grant is enough to play that one file; do not interrupt it with a library permission prompt.

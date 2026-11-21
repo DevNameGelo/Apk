@@ -8,6 +8,9 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -45,6 +48,7 @@ import androidx.compose.ui.unit.sp
 import androidx.media3.common.Player
 import com.musicrage.app.R
 import com.musicrage.app.playback.PlayerConnection
+import com.musicrage.app.playback.PlayerSnapshot
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.pow
@@ -56,98 +60,145 @@ fun NowPlayingScreen(
     favorite: Boolean,
     onToggleFavorite: () -> Unit,
     onClose: () -> Unit,
-    onFloating: () -> Unit
+    onFloating: () -> Unit,
+    showClose: Boolean = true
 ) {
     val snap = connection.snapshot
     val tint = rememberArtColor(snap.artworkUri)
-    var showSpeed by remember { mutableStateOf(false) }
 
-    Box(
+    BoxWithConstraints(
         Modifier
             .fillMaxSize()
             .background(Rage.Bg)
             .background(Brush.verticalGradient(listOf(tint, Rage.Bg), startY = 0f, endY = 1800f))
     ) {
-        Column(
-            Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(horizontal = 24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                IconAction(R.drawable.ic_chevron_down, onClose, size = 28.dp, contentDescription = "Close player")
-                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Now playing", color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp, letterSpacing = 1.2.sp)
-                    if (snap.album.isNotBlank()) {
-                        Text(snap.album, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                }
-                IconAction(R.drawable.ic_pip, onFloating, size = 22.dp, contentDescription = "Floating player")
-            }
-
-            Box(Modifier.weight(1f).fillMaxWidth().padding(vertical = 16.dp), contentAlignment = Alignment.Center) {
-                ArtImage(
-                    uri = snap.artworkUri,
-                    modifier = Modifier.fillMaxWidth().aspectRatio(1f),
-                    size = ArtSize.Large,
-                    shape = RoundedCornerShape(10.dp)
-                )
-            }
-
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(snap.title.ifBlank { "Nothing playing" }, color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Spacer(Modifier.height(2.dp))
-                    Text(snap.artist, color = Color.White.copy(alpha = 0.7f), fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                IconAction(
-                    if (favorite) R.drawable.ic_heart_fill else R.drawable.ic_heart,
-                    onToggleFavorite,
-                    tint = if (favorite) Rage.Accent else Color.White,
-                    size = 26.dp,
-                    contentDescription = if (favorite) "Remove from favorites" else "Add to favorites"
-                )
-            }
-
-            Spacer(Modifier.height(8.dp))
-            ProgressSection(connection)
-            Spacer(Modifier.height(4.dp))
-
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                IconAction(
-                    R.drawable.ic_shuffle, { connection.toggleShuffle() },
-                    tint = if (snap.shuffle) Rage.Accent else Color.White, size = 24.dp, box = 48.dp, contentDescription = "Shuffle"
-                )
-                IconAction(R.drawable.ic_skip_prev, { connection.previous() }, size = 32.dp, box = 56.dp, contentDescription = "Previous")
-                Box(
-                    Modifier.size(72.dp).clip(CircleShape).background(Color.White).clickable { connection.togglePlayPause() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    RIcon(
-                        if (snap.isPlaying) R.drawable.ic_pause else R.drawable.ic_play,
-                        tint = Color.Black, size = 32.dp,
-                        contentDescription = if (snap.isPlaying) "Pause" else "Play"
+        // Wide and short (a phone on its side, a tablet): art on the left, controls on the right.
+        val landscape = maxWidth > maxHeight && maxWidth >= 560.dp
+        val short = maxHeight < 600.dp
+        if (landscape) {
+            Row(
+                Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(horizontal = 24.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
+                    ArtImage(
+                        uri = snap.artworkUri,
+                        modifier = Modifier.fillMaxHeight(0.9f).aspectRatio(1f),
+                        size = ArtSize.Large,
+                        shape = RoundedCornerShape(10.dp)
                     )
                 }
-                IconAction(R.drawable.ic_skip_next, { connection.next() }, size = 32.dp, box = 56.dp, contentDescription = "Next")
-                IconAction(
-                    if (snap.repeatMode == Player.REPEAT_MODE_ONE) R.drawable.ic_repeat_one else R.drawable.ic_repeat,
-                    { connection.cycleRepeat() },
-                    tint = if (snap.repeatMode != Player.REPEAT_MODE_OFF) Rage.Accent else Color.White,
-                    size = 24.dp, box = 48.dp, contentDescription = "Repeat"
-                )
-            }
-
-            Spacer(Modifier.height(16.dp))
-            Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Row(
-                    Modifier.clip(RoundedCornerShape(50)).background(Color.White.copy(alpha = 0.14f))
-                        .clickable { showSpeed = true }.padding(horizontal = 14.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    RIcon(R.drawable.ic_gauge, size = 18.dp)
-                    Spacer(Modifier.width(8.dp))
-                    Text(speedLabel(snap.speed), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.width(24.dp))
+                Column(Modifier.weight(1f).fillMaxHeight().widthIn(max = 520.dp), verticalArrangement = Arrangement.Center) {
+                    NowPlayingHeader(snap, showClose, onClose, onFloating)
+                    NowPlayingControls(connection, snap, favorite, onToggleFavorite, compact = true)
                 }
             }
+        } else {
+            Column(
+                Modifier.align(Alignment.TopCenter).widthIn(max = 520.dp).fillMaxSize()
+                    .statusBarsPadding().navigationBarsPadding().padding(horizontal = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                NowPlayingHeader(snap, showClose, onClose, onFloating)
+                Box(
+                    Modifier.weight(1f).fillMaxWidth().padding(vertical = if (short) 6.dp else 16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    ArtImage(
+                        uri = snap.artworkUri,
+                        modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+                        size = ArtSize.Large,
+                        shape = RoundedCornerShape(10.dp)
+                    )
+                }
+                NowPlayingControls(connection, snap, favorite, onToggleFavorite, compact = short)
+            }
+        }
+    }
+}
+
+@Composable
+private fun NowPlayingHeader(snap: PlayerSnapshot, showClose: Boolean, onClose: () -> Unit, onFloating: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (showClose) {
+            IconAction(R.drawable.ic_chevron_down, onClose, size = 28.dp, contentDescription = "Close player")
+        } else {
+            Spacer(Modifier.size(44.dp))
+        }
+        Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("Now playing", color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp, letterSpacing = 1.2.sp)
+            if (snap.album.isNotBlank()) {
+                Text(snap.album, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        IconAction(R.drawable.ic_pip, onFloating, size = 22.dp, contentDescription = "Floating player")
+    }
+}
+
+@Composable
+private fun NowPlayingControls(
+    connection: PlayerConnection,
+    snap: PlayerSnapshot,
+    favorite: Boolean,
+    onToggleFavorite: () -> Unit,
+    compact: Boolean
+) {
+    var showSpeed by remember { mutableStateOf(false) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(snap.title.ifBlank { "Nothing playing" }, color = Color.White, fontSize = if (compact) 18.sp else 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(2.dp))
+            Text(snap.artist, color = Color.White.copy(alpha = 0.7f), fontSize = if (compact) 13.sp else 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        IconAction(
+            if (favorite) R.drawable.ic_heart_fill else R.drawable.ic_heart,
+            onToggleFavorite,
+            tint = if (favorite) Rage.Accent else Color.White,
+            size = 26.dp,
+            contentDescription = if (favorite) "Remove from favorites" else "Add to favorites"
+        )
+    }
+
+    Spacer(Modifier.height(if (compact) 2.dp else 8.dp))
+    ProgressSection(connection)
+    Spacer(Modifier.height(4.dp))
+
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+        IconAction(
+            R.drawable.ic_shuffle, { connection.toggleShuffle() },
+            tint = if (snap.shuffle) Rage.Accent else Color.White, size = 24.dp, box = 48.dp, contentDescription = "Shuffle"
+        )
+        IconAction(R.drawable.ic_skip_prev, { connection.previous() }, size = 32.dp, box = 56.dp, contentDescription = "Previous")
+        Box(
+            Modifier.size(if (compact) 60.dp else 72.dp).clip(CircleShape).background(Color.White).clickable { connection.togglePlayPause() },
+            contentAlignment = Alignment.Center
+        ) {
+            RIcon(
+                if (snap.isPlaying) R.drawable.ic_pause else R.drawable.ic_play,
+                tint = Color.Black, size = 32.dp,
+                contentDescription = if (snap.isPlaying) "Pause" else "Play"
+            )
+        }
+        IconAction(R.drawable.ic_skip_next, { connection.next() }, size = 32.dp, box = 56.dp, contentDescription = "Next")
+        IconAction(
+            if (snap.repeatMode == Player.REPEAT_MODE_ONE) R.drawable.ic_repeat_one else R.drawable.ic_repeat,
+            { connection.cycleRepeat() },
+            tint = if (snap.repeatMode != Player.REPEAT_MODE_OFF) Rage.Accent else Color.White,
+            size = 24.dp, box = 48.dp, contentDescription = "Repeat"
+        )
+    }
+
+    Spacer(Modifier.height(if (compact) 8.dp else 16.dp))
+    Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.clip(RoundedCornerShape(50)).background(Color.White.copy(alpha = 0.14f))
+                .clickable { showSpeed = true }.padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            RIcon(R.drawable.ic_gauge, size = 18.dp)
+            Spacer(Modifier.width(8.dp))
+            Text(speedLabel(snap.speed), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
         }
     }
 

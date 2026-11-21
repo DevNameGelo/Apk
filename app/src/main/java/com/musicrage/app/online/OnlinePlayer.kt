@@ -257,8 +257,13 @@ function onYouTubeIframeAPIReady() {
     width: '100%', height: '100%',
     playerVars: { playsinline: 1, autoplay: 1, controls: 0, rel: 0, origin: 'https://www.youtube.com', enablejsapi: 1, iv_load_policy: 3, modestbranding: 1 },
     events: {
-      onReady: function () { forceSound(); Android.ready(); },
-      onStateChange: function (e) { if (e.data === 1) { forceSound(); } Android.stateChanged(e.data); },
+      onReady: function () { forceSound(); try { Android.kind(0); } catch (e) {} Android.ready(); },
+      onStateChange: function (e) {
+        if (e.data === 1) { forceSound(); }
+        var vid = '';
+        try { vid = (player.getVideoData && player.getVideoData().video_id) || ''; } catch (x) {}
+        Android.stateOf(e.data, vid);
+      },
       onError: function (e) { Android.failed(e.data); }
     }
   });
@@ -267,7 +272,12 @@ function forceSound() { try { if (player && player.isMuted && player.isMuted()) 
 function load(id, start) {
   loadId = id;
   pending = null;
-  if (player && player.loadVideoById) { player.loadVideoById(id, start || 0); forceSound(); }
+  if (player && player.loadVideoById) {
+    // Silence the previous song first so two videos can never overlap.
+    try { if (player.stopVideo) { player.stopVideo(); } } catch (e) {}
+    player.loadVideoById(id, start || 0);
+    forceSound();
+  }
   else { pending = [id, start]; }
 }
 function playVideo2() { if (player) { player.playVideo(); forceSound(); } }
@@ -303,6 +313,9 @@ function killAds() {
 setInterval(killAds, 250);
 setInterval(function () {
   if (player && player.getCurrentTime && player.getDuration) {
+    // Tell the app which page type this is and which video is REALLY loaded, so it can notice (and repair)
+    // a screen that shows one song while another is still playing.
+    try { Android.kind(0); Android.nowId((player.getVideoData && player.getVideoData().video_id) || ''); } catch (e) {}
     // Only report the video the app actually asked for. While a new video is still loading the
     // iframe keeps answering for the old one, and those numbers used to leak into the new track.
     if (loadId === null || loadId === (player.getVideoData ? player.getVideoData().video_id : loadId)) {
@@ -319,6 +332,8 @@ setInterval(function () {
  */
 private const val WATCH_JS = """
 (function () {
+  // Only a real watch page runs this (a stale injection into the embed page must do nothing).
+  if (location.pathname.indexOf('/watch') !== 0) { return; }
   if (window.__mr) { return; }
   window.__mr = true;
   try {
@@ -380,6 +395,7 @@ private const val WATCH_JS = """
   window.mrPause = function () { var v = document.querySelector('video'); if (v) { v.pause(); } };
   window.mrSeek = function (s) { var v = document.querySelector('video'); if (v) { v.currentTime = s; } };
   setInterval(function () {
+    try { Android.kind(1); } catch (e) {}
     hook();
     forceSound();
     var showing = adShowing();
@@ -408,7 +424,16 @@ private class Bridge {
     fun ready() = OnlinePlayer.handleReady()
 
     @JavascriptInterface
-    fun stateChanged(code: Int) = OnlinePlayer.handleState(code)
+    fun stateChanged(code: Int) = OnlinePlayer.handleState(code, "")
+
+    @JavascriptInterface
+    fun stateOf(code: Int, id: String) = OnlinePlayer.handleState(code, id)
+
+    @JavascriptInterface
+    fun kind(kind: Int) = OnlinePlayer.handleKind(kind)
+
+    @JavascriptInterface
+    fun nowId(id: String) = OnlinePlayer.handleNowId(id)
 
     @JavascriptInterface
     fun time(position: Double, duration: Double) = OnlinePlayer.handleTime(position, duration)
@@ -561,11 +586,13 @@ object OnlinePlayer {
         watchMode = true
         view.loadUrl("https://m.youtube.com/watch?v=$id" + if (start > 0) "&t=${start.toInt()}s" else "")
         runJs("javascript:Android.ready()")
-        main.postDelayed({ injectWatchJs() }, 1_200L)
-        main.postDelayed({ injectWatchJs() }, 3_000L)
+        val token = watchToken
+        main.postDelayed({ if (token == watchToken) injectWatchJs() }, 1_200L)
+        main.postDelayed({ if (token == watchToken) injectWatchJs() }, 3_000L)
     }
 
     private fun injectWatchJs() {
+        if (!watchMode) return
         runJs(WATCH_JS)
     }
 
@@ -708,6 +735,8 @@ object OnlinePlayer {
     private var autoplayBusy = false
     private var endedGeneration = -1L
     private var frozenHits = 0
+    private var idMismatch = 0
+    private var startedAtMs = 0L
 
     fun play(video: OnlineVideo, list: List<OnlineVideo>) {
         // Only the chosen song is queued. What plays after it is picked from similar music, never from the
@@ -733,9 +762,12 @@ object OnlinePlayer {
         if (!Regex("[A-Za-z0-9_-]{6,20}").matches(video.id)) return
         val context = appContext ?: return
         // Any event still on its way from the previous video is now obsolete.
+        if (!heal && state.video != null && state.video?.id != video.id) jsPause()
         generation += 1
         val gen = generation
         frozenHits = 0
+        idMismatch = 0
+        startedAtMs = android.os.SystemClock.uptimeMillis()
         if (!heal) {
             failStreak = 0
             healStage = 0
@@ -884,10 +916,10 @@ object OnlinePlayer {
     // The embed page and the watch page expose different control functions; watchMode says which
     // one is live. (The old URL sniffing also matched the embed page's own iframe URL.)
     private fun jsPlay() = runJs(
-        if (watchMode) "try{ mrPlay(); }catch(e){}" else "try{ playVideo2(); }catch(e){}"
+        "try{ if (typeof mrPlay === 'function') { mrPlay(); } if (typeof playVideo2 === 'function') { playVideo2(); } }catch(e){}"
     )
     private fun jsPause() = runJs(
-        if (watchMode) "try{ mrPause(); }catch(e){}" else "try{ pauseVideo2(); }catch(e){}"
+        "try{ if (typeof mrPause === 'function') { mrPause(); } if (typeof pauseVideo2 === 'function') { pauseVideo2(); } }catch(e){}"
     )
 
     fun toggle() {
@@ -932,7 +964,7 @@ object OnlinePlayer {
 
     fun seekTo(seconds: Double) {
         positionSec = seconds
-        runJs(if (watchMode) "try{ mrSeek(${seconds.toInt()}); }catch(e){}" else "try{ seek(${seconds.toInt()}); }catch(e){}")
+        runJs("try{ if (typeof mrSeek === 'function') { mrSeek(${seconds.toInt()}); } if (typeof seek === 'function') { seek(${seconds.toInt()}); } }catch(e){}")
     }
 
     // ---- Callbacks from the page (called on a WebView thread) ------------------------------------------------------
@@ -950,12 +982,16 @@ object OnlinePlayer {
         }
     }
 
-    internal fun handleState(code: Int) {
+    internal fun handleState(code: Int, videoId: String = "") {
         // Capture the generation on the WebView thread, before the hop to the main thread.
         val gen = generation
         main.post {
             // The user started another video or stopped playback while this event was in flight: drop it.
             if (gen != generation) return@post
+            // An event about a different video than the one on screen (the old song still winding down, or a
+            // player that never switched) must not make the new song look live.
+            val wanted = state.video?.id
+            if (videoId.isNotEmpty() && wanted != null && videoId != wanted) return@post
             val context = appContext
             when (code) {
                 1 -> {
@@ -1106,6 +1142,41 @@ object OnlinePlayer {
                 OnlineStore.saveLast(context, adopted, 0.0)
                 state = state.copy(video = adopted)
                 listener?.invoke()
+            }
+        }
+    }
+
+    /** The page itself says whether it is the embed player (0) or the watch page (1), so the flag cannot drift. */
+    internal fun handleKind(kind: Int) {
+        main.post {
+            val watch = kind == 1
+            if (watchMode != watch) {
+                watchMode = watch
+                if (watch) pageReady = true
+            }
+        }
+    }
+
+    /**
+     * Once a second the embed page reports which video is really loaded. If it stays different from the song on
+     * screen after the switch should long be done, the screen and the sound disagree: repair it quietly.
+     */
+    internal fun handleNowId(id: String) {
+        val gen = generation
+        main.post {
+            if (gen != generation || id.isBlank()) return@post
+            val wanted = state.video?.id ?: return@post
+            if (id == wanted) {
+                idMismatch = 0
+                return@post
+            }
+            if (android.os.SystemClock.uptimeMillis() - startedAtMs < 4_000L) return@post
+            idMismatch += 1
+            if (idMismatch >= 3) {
+                idMismatch = 0
+                appContext?.let { OnlineStore.log(it, "out of sync: page $id, screen $wanted") }
+                jsPause()
+                healFailure(generation)
             }
         }
     }
