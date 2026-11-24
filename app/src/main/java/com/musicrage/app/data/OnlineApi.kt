@@ -147,7 +147,7 @@ object OnlineApi {
 
     // ---- YouTube search: mp3juice (primary) + Piped (fallback) ---------------------------------------------------------
 
-    private const val MP3JUICE_API_KEY = "mp3juice_c1ce77421b808bc5b89a307da142f3211313469053730109c30c3c4fc9abff3b"
+    private const val MP3JUICE_API_KEY = "mp3juice_d9ac7e96e963b74fb4fb9bd37598a8e5e810e0f736cfe17a982bcd1e660e01cd"
     private const val SITE = "https://mp3juice.sc"
     private const val PIPED_API = "https://api.piped.private.coffee"
 
@@ -158,22 +158,22 @@ object OnlineApi {
     }
 
     /**
-     * Searches YouTube for songs. mp3juice's yt results are the primary source (fast, official),
-     * Piped's public search is the fallback when mp3juice does not answer. Titles are cleaned of the
+     * Searches YouTube for songs. mp3juice's search is the primary source — the same endpoint the
+     * site's browser hits, with its current key and encoding — and Piped's public search tops the
+     * list up when mp3juice comes back thin or is unreachable. Titles are cleaned of the
      * "Official Video / Lyric Video" noise so the list reads like a music app.
      */
     fun search(query: String, playableOnly: Boolean = true): List<OnlineVideo> {
         val text = query.trim()
         if (text.isEmpty()) return emptyList()
         val out = LinkedHashMap<String, OnlineVideo>()
-        // 1) Piped search — fast and live (mp3juice's search started answering 403 in late 2026,
-        //    which made every query wait for a dead endpoint before falling through).
-        for (video in runCatching { pipedSearch(text) }.getOrDefault(emptyList())) {
+        // 1) mp3juice yt search — the site's own endpoint; its results are official uploads first.
+        for (video in runCatching { mp3juiceSearch(text) }.getOrDefault(emptyList())) {
             if (video.id.isNotEmpty() && video.id !in out) out[video.id] = video
         }
-        // 2) mp3juice yt search — the former primary, now the top-up when Piped comes back thin.
+        // 2) Piped search — fills artist names, durations and covers mp3juice lacks.
         if (out.size < 5) {
-            for (video in runCatching { mp3juiceSearch(text) }.getOrDefault(emptyList())) {
+            for (video in runCatching { pipedSearch(text) }.getOrDefault(emptyList())) {
                 if (video.id.isNotEmpty() && video.id !in out) out[video.id] = video
             }
         }
@@ -183,13 +183,14 @@ object OnlineApi {
 
     /** mp3juice's YouTube results: {count, ytCount, yt:[{id,title,duration}], sc…}. */
     private fun mp3juiceSearch(text: String): List<OnlineVideo> {
-        val b64 = java.util.Base64.getEncoder().encodeToString(encode(text).toByteArray(Charsets.UTF_8))
+        // The site's own encoding: btoa(encodeURIComponent(text)) — percent-encode first, THEN
+        // base64 that string. (The old code base64-encoded the URLEncode-encoded text, a
+        // different string, which is why the site worked in a browser while the app 403'd.)
+        val percent = java.net.URLEncoder.encode(text, "UTF-8")
+        val b64 = android.util.Base64.encodeToString(percent.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
         val raw = get(
-            "$SITE/api/v1/search?api_key=${encode(MP3JUICE_API_KEY)}&y=y&q=$b64",
+            "$SITE/api/v1/search?api_key=$MP3JUICE_API_KEY&y=y&q=$b64",
             browser = true,
-            // Secondary source: when this endpoint is down (it started returning 403 in late 2026)
-            // the search must not sit through a long timeout — Piped's results already fill the list.
-            fast = true,
             headers = mapOf("Origin" to SITE, "Referer" to "$SITE/", "Accept" to "application/json, text/plain, */*")
         )
         val items = JSONObject(raw).optJSONArray("yt") ?: JSONArray()
@@ -618,12 +619,23 @@ object OnlineApi {
         val id = encode(sourceUrl)
         setProgress(5)
 
-        // New converter first (verified working); the old thetacloud flow stays as a fallback in
-        // case yt-api.org is ever the one that goes down. Keep its error for the toast if both fail.
-        val ytApiError = runCatching { prepareMp3ViaYtApi(videoIdFrom(sourceUrl)) }
-        ytApiError.getOrNull()?.let { return it }
-        setProgress(10)
+        // The site's own converter first: thetacloud works from residential and mobile networks
+        // (the browser on mp3juice.sc uses exactly this flow). yt-api.org answers from datacenter
+        // IPs where theta is blocked, so it stays as the fallback; together one of the two
+        // always answers.
+        var lastError: String? = null
+        val theta = runCatching { prepareMp3ViaTheta(sourceUrl, id) }
+        theta.getOrNull()?.let { return it }
+        lastError = theta.exceptionOrNull()?.message
 
+        val ytApi = runCatching { prepareMp3ViaYtApi(videoIdFrom(sourceUrl)) }
+        ytApi.getOrNull()?.let { return it }
+        lastError = ytApi.exceptionOrNull()?.message ?: lastError
+        throw ApiException(lastError ?: "no converter could be reached")
+    }
+
+    /** The thetacloud flow exactly as mp3juice.sc's browser runs it: auth -> init -> convert -> progress. */
+    private fun prepareMp3ViaTheta(sourceUrl: String, id: String): String {
         var token = ""
         var authProblem = "no token returned"
         for (withKey in listOf(false, true)) {
@@ -638,7 +650,7 @@ object OnlineApi {
                 authProblem = e.message ?: "network error"
             }
         }
-        if (token.isBlank()) throw ApiException(ytApiError.exceptionOrNull()?.message?.let { "Auth failed: $it" } ?: "Auth failed: $authProblem")
+        if (token.isBlank()) throw ApiException("Auth failed: $authProblem")
         setProgress(12)
         val init = step("Init") { JSONObject(get("$CONVERT_HOST/init?_=${clock()}", browser = true, headers = siteHeaders(token))) }
         val convertUrl = init.optString("convertURL")
@@ -696,15 +708,12 @@ object OnlineApi {
         connection.connectTimeout = 15_000
         connection.readTimeout = 30_000
         connection.setRequestProperty("User-Agent", BROWSER_AGENT)
-        connection.setRequestProperty("Referer", "$SITE/")
+        connection.setRequestProperty("Referer", if (url.contains("hei.lat") || url.contains("yt-api.org")) "$YTAPI_HOST/" else "$SITE/")
         try {
             val code = connection.responseCode
             if (code !in 200..299 && code != 206) {
                 val body = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
                 throw ApiException("Download failed: " + errorMessage(body, code))
-            } else if (url.contains("hei.lat") || url.contains("yt-api.org")) {
-                // The new converter serves from its own CDN: it needs its own origin, not mp3juice's.
-                connection.setRequestProperty("Referer", "$YTAPI_HOST/")
             }
             val buffer = ByteArrayOutputStream()
             val contentLength = connection.contentLength

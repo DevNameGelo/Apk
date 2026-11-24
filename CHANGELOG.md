@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.35
+- Online playback completely rebuilt: songs now stream the converter's actual MP3 straight into Android's audio player — no embedded video player that a network can refuse. This is the same audio the mp3juice website itself serves, so it starts fast and never stalls in the endless loading-then-switching loop.
+- Search uses the exact request the mp3juice website sends (its current key and its exact query encoding) — the app's old key and double-encoded queries were being rejected.
+- Downloads try the site's own converter first (reachable from Philippine mobile networks) with the alternate converter as backup; the reverse of 1.2.34's order, which was unreachable on the networks it was first tried on.
+- Fixed a dead fallback in the download step (the correct Referer was applied only after the request had already been answered).
+
 ## 1.2.34
 - Fixed: downloads failed with "Auth failed: HTTP 403" — the old converter host stopped serving the app. Downloads now use a live converter (yt-api.org, the same one behind mp3juice's own button), with the old flow kept as a backup.
 - Fixed: the Online tab took very long to start a song, and sometimes never started one. Two dead endpoints were being tried before the live ones: search now goes to the live source first, and the fallback waits seconds instead of tens of seconds before moving on.
