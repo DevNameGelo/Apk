@@ -13,6 +13,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.musicrage.app.data.MusicPreferences
 import com.musicrage.app.data.OnlineVideo
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * One online song while it plays. `hasNext` is always true: after a song ends a similar one is
@@ -475,5 +477,167 @@ object OnlinePlayer {
     private object IntentHolder {
         fun serviceIntent(context: Context): android.content.Intent =
             android.content.Intent(context, OnlineService::class.java)
+    }
+}
+object OnlineStore {
+    private const val KEY_LAST = "online_last"
+    private const val KEY_POSITION = "online_position"
+    private const val KEY_ALIVE = "online_alive"
+    private const val KEY_BEAT = "online_beat"
+    private const val KEY_HISTORY = "online_history"
+
+    private fun prefs(context: Context) = context.getSharedPreferences(MusicPreferences.FILE, Context.MODE_PRIVATE)
+
+    private fun toJson(video: OnlineVideo) = JSONObject()
+        .put("id", video.id).put("title", video.title).put("channel", video.channel).put("thumb", video.thumb)
+        .put("permalink", video.permalink)
+        // A NaN here throws JSONException ("Forbidden numeric value") on save and crashed the app on
+        // the Online tab when an entry from an older build was rewritten, so it is never stored.
+        .put("duration", if (video.duration.isNaN() || video.duration < 0) 0.0 else video.duration)
+        .put("playable", video.playable)
+        .put("album", video.album)
+
+    private fun fromJson(obj: JSONObject) = OnlineVideo(
+        obj.optString("id"),
+        obj.optString("title"),
+        obj.optString("channel"),
+        obj.optString("thumb"),
+        obj.optString("permalink"),
+        // Entries saved by older builds have no "duration"; the no-fallback optDouble would hand
+        // back NaN and blow up the very next save. Anything unreadable counts as "unknown" (0), not NaN.
+        obj.optDouble("duration", 0.0).takeUnless { it.isNaN() } ?: 0.0,
+        obj.optBoolean("playable", true),
+        obj.optLong("likes", 0L),
+        // Older entries have no "album"; the download falls back to the song title when blank.
+        obj.optString("album")
+    )
+
+    fun saveLast(context: Context, video: OnlineVideo, positionSec: Double) {
+        prefs(context).edit().putString(KEY_LAST, toJson(video).toString()).putFloat(KEY_POSITION, positionSec.toFloat()).apply()
+    }
+
+    fun savePosition(context: Context, positionSec: Double) {
+        prefs(context).edit().putFloat(KEY_POSITION, positionSec.toFloat()).apply()
+    }
+
+    /** Removes the "continue playing" pointer so a stopped player cannot be resurrected by mistake. */
+    fun clearLast(context: Context) {
+        prefs(context).edit().remove(KEY_LAST).remove(KEY_POSITION).putBoolean(KEY_ALIVE, false).apply()
+    }
+
+    fun loadLast(context: Context): Pair<OnlineVideo, Double>? {
+        val raw = prefs(context).getString(KEY_LAST, null) ?: return null
+        val position = prefs(context).getFloat(KEY_POSITION, 0f).toDouble()
+        return runCatching { fromJson(JSONObject(raw)) to position }.getOrNull()
+    }
+
+    fun history(context: Context): List<OnlineVideo> {
+        val raw = prefs(context).getString(KEY_HISTORY, null) ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            (0 until array.length()).mapNotNull { i ->
+                array.optJSONObject(i)?.let { fromJson(it) }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun removeHistory(context: Context, id: String) {
+        val kept = history(context).filter { it.id != id }
+        prefs(context).edit().putString(KEY_HISTORY, JSONArray().apply { kept.forEach { put(toJson(it)) } }.toString()).apply()
+    }
+
+    fun addHistory(context: Context, video: OnlineVideo) {
+        val list = (history(context).filter { it.id != video.id } + video).takeLast(60)
+        prefs(context).edit().putString(KEY_HISTORY, JSONArray().apply { list.forEach { put(toJson(it)) } }.toString()).apply()
+    }
+
+    fun isAlive(context: Context) = prefs(context).getBoolean(KEY_ALIVE, false)
+
+    fun setAlive(context: Context, alive: Boolean) {
+        prefs(context).edit().putBoolean(KEY_ALIVE, alive).apply()
+    }
+
+    /** The moment the app last saw the player alive; recovery uses this after a process kill. */
+    fun beat(context: Context) {
+        prefs(context).edit().putLong(KEY_BEAT, System.currentTimeMillis()).apply()
+    }
+
+    fun beatAgeMs(context: Context): Long =
+        System.currentTimeMillis() - prefs(context).getLong(KEY_BEAT, 0L)
+
+    // ---- Self-healing state (blocked ids, listening taste, dead ids, log) ------------------------------------------
+
+    private const val KEY_BLOCKED = "online_blocked"
+    private const val KEY_TASTE = "online_taste"
+    private const val KEY_DEAD = "online_dead"
+    private const val KEY_LOG = "online_log"
+    private const val KEY_SEEN = "online_seen_v3"
+
+    /**
+     * Runs once per install: drops the SoundCloud-era saved state. SoundCloud track ids are pure
+     * numbers and can never play in the YouTube player, so they are removed from history, taste
+     * and the "continue playing" pointer (a blank slate, not a crash on the first tap).
+     */
+    fun onboard(context: Context) {
+        val p = prefs(context)
+        if (p.getBoolean(KEY_SEEN, false)) return
+        val numeric = Regex("\\d{6,20}")
+        val edit = p.edit().putBoolean(KEY_SEEN, true)
+        val oldHistory = history(context)
+        if (oldHistory.isNotEmpty() && oldHistory.any { numeric.matches(it.id) }) {
+            val kept = oldHistory.filter { !numeric.matches(it.id) }
+            val array = JSONArray()
+            kept.forEach { array.put(toJson(it)) }
+            edit.putString(KEY_HISTORY, array.toString())
+        }
+        val last = loadLast(context)
+        if (last != null && numeric.matches(last.first.id)) {
+            edit.remove(KEY_LAST).remove(KEY_POSITION).putBoolean(KEY_ALIVE, false)
+        }
+        if (p.getStringSet(KEY_DEAD, emptySet())?.orEmpty()?.any { numeric.matches(it) } == true) {
+            edit.remove(KEY_DEAD)
+        }
+        if (p.getStringSet(KEY_BLOCKED, emptySet())?.orEmpty()?.any { numeric.matches(it) } == true) {
+            edit.remove(KEY_BLOCKED)
+        }
+        edit.apply()
+    }
+
+    // ---- What the person listens to ------------------------------------------------------------------------------
+
+    fun taste(context: Context): Map<String, Int> {
+        val raw = prefs(context).getString(KEY_TASTE, null) ?: return emptyMap()
+        return runCatching {
+            val obj = JSONObject(raw)
+            obj.keys().asSequence().associateWith { obj.optInt(it) }
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun bumpTaste(context: Context, channel: String, delta: Int) {
+        if (channel.isBlank()) return
+        val map = taste(context).toMutableMap()
+        map[channel] = (map[channel] ?: 0) + delta
+        prefs(context).edit().putString(KEY_TASTE, JSONObject(map as Map<*, *>).toString()).apply()
+    }
+
+    fun recordPlay(context: Context, video: OnlineVideo) = bumpTaste(context, video.channel, 1)
+    fun recordFinished(context: Context, video: OnlineVideo) = bumpTaste(context, video.channel, 2)
+    fun recordSkip(context: Context, video: OnlineVideo) = bumpTaste(context, video.channel, -1)
+
+    fun favoriteChannels(context: Context, limit: Int): List<String> =
+        taste(context).entries.filter { it.value > 0 }.sortedByDescending { it.value }.map { it.key }.take(limit)
+
+    fun dead(context: Context): Set<String> =
+        prefs(context).getStringSet(KEY_DEAD, emptySet())?.toSet() ?: emptySet()
+
+    fun addDead(context: Context, id: String) {
+        prefs(context).edit().putStringSet(KEY_DEAD, dead(context) + id).apply()
+    }
+
+    /** Small ring buffer of what the watchdog saw and fixed. Never shown; kept for diagnosis. */
+    fun log(context: Context, line: String) {
+        val lines = (prefs(context).getString(KEY_LOG, "").orEmpty().split("\n").filter { it.isNotBlank() } +
+            "${System.currentTimeMillis()} $line").takeLast(40)
+        prefs(context).edit().putString(KEY_LOG, lines.joinToString("\n")).apply()
     }
 }
