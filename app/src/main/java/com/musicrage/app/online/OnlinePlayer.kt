@@ -823,9 +823,17 @@ object OnlinePlayer {
     /** If the song still has not started after a while, repair it quietly. */
     private fun armWatchTimeout(gen: Long) {
         val token = watchToken
+        // The first wait is short: a healthy embed answers within a few seconds, and a reload
+        // that is going to fail anyway should not make the person stare at a spinner for 12s
+        // (three of those in a row was most of a minute of nothing happening).
+        val waitMs = when {
+            healStage == 0 && !watchMode -> 6_000L
+            watchMode -> 15_000L
+            else -> 10_000L
+        }
         main.postDelayed({
             if (token == watchToken && gen == generation && OnlineLoading.active) healFailure(gen)
-        }, 12_000L)
+        }, waitMs)
     }
 
     /**

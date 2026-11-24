@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.34
+- Fixed: downloads failed with "Auth failed: HTTP 403" — the old converter host stopped serving the app. Downloads now use a live converter (yt-api.org, the same one behind mp3juice's own button), with the old flow kept as a backup.
+- Fixed: the Online tab took very long to start a song, and sometimes never started one. Two dead endpoints were being tried before the live ones: search now goes to the live source first, and the fallback waits seconds instead of tens of seconds before moving on.
+- The self-repair ladder between a stuck song and a new one is much faster (6–15 seconds per stage instead of 12 × 3).
+
 ## 1.2.33
 - Fixed the Online player showing one song while another kept playing (and then ignoring pause, back and next, even from the notification). The player controls only worked when the app's own "watch page" flag matched the page that was really loaded; when they disagreed every command (load, pause, seek) silently did nothing. The page now reports its own type, the controls work on either page, the old song is silenced before the new one loads, events and the one-second "which video is really loaded" report from the previous song can no longer make the new song look live, and if the screen and the sound ever disagree the app repairs it by itself. A stale watch-page script can no longer be injected into the embed page after a switch.
 - Fixed the bottom player bar staying on the online song after you start a local one: the bar now follows whichever player is actually playing.

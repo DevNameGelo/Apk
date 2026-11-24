@@ -47,10 +47,12 @@ object OnlineApi {
 
     // ---- HTTP ------------------------------------------------------------------------------------------------------------
 
-    private fun get(url: String, browser: Boolean = false, headers: Map<String, String> = emptyMap(), range: String? = null): String {
+    private fun get(url: String, browser: Boolean = false, headers: Map<String, String> = emptyMap(), range: String? = null, fast: Boolean = false): String {
         val connection = URL(url).openConnection() as HttpURLConnection
-        connection.connectTimeout = 10_000
-        connection.readTimeout = 20_000
+        // "fast" is for endpoints only used as extra sources: a dead one must fail in seconds,
+        // not stall the whole search while its 20-second read timeout slowly runs out.
+        connection.connectTimeout = if (fast) 4_000 else 10_000
+        connection.readTimeout = if (fast) 5_000 else 20_000
         if (browser) {
             connection.setRequestProperty("User-Agent", BROWSER_AGENT)
             connection.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
@@ -65,6 +67,39 @@ object OnlineApi {
             val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
             if (code !in 200..299 && code != 206) throw ApiException(errorMessage(body, code))
             return body
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    /** POST + response headers, for APIs that return their token in a header (yt-api.org). */
+    private fun postJson(url: String, body: String?, authHeader: String? = null, referer: String): Pair<String, Map<String, List<String>>> {
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 12_000
+        connection.readTimeout = 20_000
+        // The converter's /api endpoint only accepts urlencoded requests with an empty body —
+        // a JSON body there gets answered with 401 Unauthorized.
+        connection.setRequestProperty("Content-Type", if (body == null) "application/x-www-form-urlencoded" else "application/json")
+        connection.setRequestProperty("Accept", "application/json")
+        connection.setRequestProperty("X-Requested-With", "XMLHttpRequest")
+        connection.setRequestProperty("User-Agent", BROWSER_AGENT)
+        connection.setRequestProperty("Origin", "https://yt-api.org")
+        connection.setRequestProperty("Referer", referer)
+        if (authHeader != null) connection.setRequestProperty("Authorization", authHeader)
+        if (body != null) connection.doOutput = true
+        try {
+            if (body != null) connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            // headerFields conveniently skips the status line; keys are already case-insensitive there
+            // but normalized here anyway to be safe.
+            val headers = (connection.headerFields ?: emptyMap())
+                .filterKeys { it != null }
+                .mapKeys { it.key.lowercase() }
+            if (code !in 200..299) throw ApiException(errorMessage(text, code))
+            return text to headers
         } finally {
             connection.disconnect()
         }
@@ -131,13 +166,14 @@ object OnlineApi {
         val text = query.trim()
         if (text.isEmpty()) return emptyList()
         val out = LinkedHashMap<String, OnlineVideo>()
-        // 1) mp3juice yt search
-        for (video in runCatching { mp3juiceSearch(text) }.getOrDefault(emptyList())) {
+        // 1) Piped search — fast and live (mp3juice's search started answering 403 in late 2026,
+        //    which made every query wait for a dead endpoint before falling through).
+        for (video in runCatching { pipedSearch(text) }.getOrDefault(emptyList())) {
             if (video.id.isNotEmpty() && video.id !in out) out[video.id] = video
         }
-        // 2) Piped search — fills artist names, durations and covers mp3juice lacks
+        // 2) mp3juice yt search — the former primary, now the top-up when Piped comes back thin.
         if (out.size < 5) {
-            for (video in runCatching { pipedSearch(text) }.getOrDefault(emptyList())) {
+            for (video in runCatching { mp3juiceSearch(text) }.getOrDefault(emptyList())) {
                 if (video.id.isNotEmpty() && video.id !in out) out[video.id] = video
             }
         }
@@ -151,6 +187,9 @@ object OnlineApi {
         val raw = get(
             "$SITE/api/v1/search?api_key=${encode(MP3JUICE_API_KEY)}&y=y&q=$b64",
             browser = true,
+            // Secondary source: when this endpoint is down (it started returning 403 in late 2026)
+            // the search must not sit through a long timeout — Piped's results already fill the list.
+            fast = true,
             headers = mapOf("Origin" to SITE, "Referer" to "$SITE/", "Accept" to "application/json, text/plain, */*")
         )
         val items = JSONObject(raw).optJSONArray("yt") ?: JSONArray()
@@ -330,6 +369,8 @@ object OnlineApi {
      */
     fun related(video: OnlineVideo): List<OnlineVideo> {
         val out = LinkedHashMap<String, OnlineVideo>()
+        // Each search source is tried independently and merges fast; Piped (live) answers first,
+        // so the artist's other songs come up even when the secondary search host is down.
         // 1) The artist's other songs.
         if (video.channel.isNotBlank()) {
             for (v in runCatching { search("${video.channel} songs") }.getOrDefault(emptyList())) {
@@ -540,10 +581,48 @@ object OnlineApi {
 
     private fun clock() = System.currentTimeMillis()
 
+    /**
+     * New converter: yt-api.org (the API behind the mp3juice widget, verified working after the old
+     * thetacloud host started returning 403 for everyone). Flow, exactly as the widget's own JS does it:
+     * POST / with Authorization = base64({videoId, format}) — the JWT token comes back in the
+     * "authorization" response header; POST /api with that token returns the downloadUrl directly.
+     */
+    private const val YTAPI_HOST = "https://yt-api.org"
+
+    /** Extracts the 11-char video id from any YouTube URL (or passes a bare id through). */
+    private fun videoIdFrom(sourceUrl: String): String {
+        val direct = Regex("([A-Za-z0-9_-]{11})").find(sourceUrl)?.groupValues?.get(1)
+        return if (sourceUrl.length == 11) sourceUrl else direct ?: sourceUrl
+    }
+
+    private fun prepareMp3ViaYtApi(videoId: String): String {
+        setProgress(8)
+        // The converter's own widget does POST / (token) then POST /api (convert) — the second call
+        // answers directly with the downloadUrl, no progress polling needed.
+        val body = """{"videoId":"$videoId","format":"mp3"}"""
+        val auth = android.util.Base64.encodeToString(body.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+        val (_, tokenHeaders) = postJson("$YTAPI_HOST/", body, authHeader = auth, referer = "$YTAPI_HOST/button/mp3/$videoId")
+        val token = tokenHeaders["authorization"]?.firstOrNull()?.takeIf { it.isNotBlank() }
+            ?: throw ApiException("the converter returned no token")
+        setProgress(16)
+
+        val (convertReply, _) = postJson("$YTAPI_HOST/api", body = null, authHeader = token, referer = "$YTAPI_HOST/button/mp3/$videoId")
+        val downloadUrl = runCatching { JSONObject(convertReply).optString("downloadUrl") }.getOrDefault("")
+        if (downloadUrl.isBlank()) throw ApiException("the server returned no download link")
+        setProgress(30)
+        return downloadUrl
+    }
+
     /** auth -> init -> convert (-> redirect) (-> progress). Returns the final MP3 link. Call off the main thread. */
     fun prepareMp3(sourceUrl: String): String {
         val id = encode(sourceUrl)
         setProgress(5)
+
+        // New converter first (verified working); the old thetacloud flow stays as a fallback in
+        // case yt-api.org is ever the one that goes down. Keep its error for the toast if both fail.
+        val ytApiError = runCatching { prepareMp3ViaYtApi(videoIdFrom(sourceUrl)) }
+        ytApiError.getOrNull()?.let { return it }
+        setProgress(10)
 
         var token = ""
         var authProblem = "no token returned"
@@ -559,9 +638,8 @@ object OnlineApi {
                 authProblem = e.message ?: "network error"
             }
         }
-        if (token.isBlank()) throw ApiException("Auth failed: $authProblem")
+        if (token.isBlank()) throw ApiException(ytApiError.exceptionOrNull()?.message?.let { "Auth failed: $it" } ?: "Auth failed: $authProblem")
         setProgress(12)
-
         val init = step("Init") { JSONObject(get("$CONVERT_HOST/init?_=${clock()}", browser = true, headers = siteHeaders(token))) }
         val convertUrl = init.optString("convertURL")
         if (convertUrl.isBlank()) throw ApiException("Init failed: ${serverError(init) ?: "no convert address returned"}")
@@ -624,6 +702,9 @@ object OnlineApi {
             if (code !in 200..299 && code != 206) {
                 val body = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
                 throw ApiException("Download failed: " + errorMessage(body, code))
+            } else if (url.contains("hei.lat") || url.contains("yt-api.org")) {
+                // The new converter serves from its own CDN: it needs its own origin, not mp3juice's.
+                connection.setRequestProperty("Referer", "$YTAPI_HOST/")
             }
             val buffer = ByteArrayOutputStream()
             val contentLength = connection.contentLength
